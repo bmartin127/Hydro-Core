@@ -1,0 +1,35 @@
+# Build output
+build/
+out/
+*.dll
+*.pdb
+*.obj
+*.lib
+*.exp
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CMakeScripts/
+Testing/
+compile_commands.json
+
+# Third-party dependencies (see deps/README.md for how to fetch)
+deps/*
+!deps/README.md
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*.user
+*.suo
+
+# Windows noise
+Thumbs.db
+desktop.ini
+bash.exe.stackdump
+*.stackdump
