@@ -257,11 +257,26 @@ void LuaRuntime::registerModule(const char* moduleName, std::function<void(lua_S
     // Call the initializer to push the module table
     initializer(m_state);
 
-    // Store in the modules registry
+    // Store in the Hydro modules registry. l_safe_require (Tier 1 sandbox)
+    // reads from here.
     lua_getfield(m_state, LUA_REGISTRYINDEX, "_HYDRO_MODULES");
     lua_pushvalue(m_state, -2); // copy module table
     lua_setfield(m_state, -2, moduleName);
-    lua_pop(m_state, 2); // pop registry + module table
+    lua_pop(m_state, 1); // pop _HYDRO_MODULES, leave module table on top
+
+    // Also store in package.loaded so standard Lua require() finds it.
+    // Tier 2 environments use the stock require, so without this they
+    // cannot resolve Hydro.* modules.
+    lua_getglobal(m_state, "package");
+    if (lua_istable(m_state, -1)) {
+        lua_getfield(m_state, -1, "loaded");
+        if (lua_istable(m_state, -1)) {
+            lua_pushvalue(m_state, -3); // copy module table
+            lua_setfield(m_state, -2, moduleName);
+        }
+        lua_pop(m_state, 1); // package.loaded
+    }
+    lua_pop(m_state, 2); // package, module table
 
     logInfo("LuaRuntime: Registered module '%s'", moduleName);
 }

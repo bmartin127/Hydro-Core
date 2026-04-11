@@ -10,15 +10,15 @@
 #include <psapi.h>
 #endif
 
-/**
- * EngineAPI - Pure C++ engine reflection. ZERO UE4SS headers.
+/*
+ * EngineAPI: pure C++ engine reflection layer. No UE4SS headers touched here.
  *
  * Bootstrap sequence:
  *   1. Find game module (largest loaded DLL/exe)
- *   2. Pattern scan for GUObjectArray ("Unable to add more objects" string)
- *   3. Pattern scan for StaticLoadObject ("Failed to find object" string)
- *   4. Pattern scan for FName::ToString ("None" string + characteristic code)
- *   5. Get ProcessEvent from first UObject's vtable at offset 0x278
+ *   2. Pattern scan for GUObjectArray via the "Unable to add more objects" string
+ *   3. Pattern scan for StaticLoadObject via the "Failed to find object" string
+ *   4. Pattern scan for FName::ToString via the "None" string
+ *   5. Get ProcessEvent from the first UObject's vtable at offset 0x278
  *   6. Iterate GUObjectArray to find UWorld, GameplayStatics CDO, spawn UFunctions
  *   7. Ready to spawn actors via ProcessEvent
  */
@@ -117,7 +117,7 @@ static void* s_gameplayStaticsCDO = nullptr;   // Default__GameplayStatics
 static void* s_spawnFunc = nullptr;            // BeginDeferredActorSpawnFromClass UFunction*
 static void* s_finishSpawnFunc = nullptr;      // FinishSpawningActor UFunction*
 
-// AssetRegistry loading (the PROVEN path - same as BPModLoaderMod)
+// AssetRegistry loading (same dispatch path BPModLoaderMod uses)
 static void* s_fnameConstructor = nullptr;     // FName(const TCHAR*, EFindName) function
 static void* s_assetRegHelpersCDO = nullptr;   // Default__AssetRegistryHelpers
 static void* s_getAssetFunc = nullptr;         // AssetRegistryHelpers:GetAsset UFunction
@@ -376,7 +376,7 @@ static void* safeCallLoadObject(void* funcAddr, const wchar_t* path, uint32_t fl
 
 static bool findStaticLoadObject() {
     // "Failed to find object" is in StaticFindObject (find-only, no disk loading).
-    // Save it as a useful bonus, but we need the REAL loader.
+    // Save it as a useful bonus, but we still need the actual loader.
     uint8_t* findStr = findWideString(s_gm.base, s_gm.size, L"Failed to find object");
     if (!findStr) {
         Hydro::logWarn("EngineAPI: 'Failed to find object' string not found");
@@ -434,8 +434,8 @@ static bool findStaticLoadObject() {
         Hydro::logInfo("EngineAPI: StaticFindObject confirmed at %p", s_staticFindObject);
     }
 
-    // Now find the REAL StaticLoadObject - it calls LoadPackage which
-    // references "Can't find file for package" or "CreateLinker" strings.
+    // Now find the actual StaticLoadObject, which calls LoadPackage. That
+    // path references "Can't find file for package" or "CreateLinker".
     // StaticLoadObject itself has "Attempting to load object" or is near "LoadObject".
     const wchar_t* loadStrings[] = {
         L"Attempting to find",
@@ -712,7 +712,7 @@ bool initialize() {
         }
     } // end !fromCache
 
-    // Step 2: SAFE TEST - call StaticLoadObject with a known safe path
+    // Step 2: sanity-check the discovered StaticLoadObject with a known path
     Hydro::logInfo("EngineAPI: Testing StaticLoadObject call...");
     {
         auto fn = (StaticLoadObjectFn_t)s_staticLoadObject;
@@ -1121,7 +1121,7 @@ static bool discoverAssetRegistry() {
     using FindObjFn = void*(__fastcall*)(void*, void*, const wchar_t*, bool);
 
     auto find = [](const wchar_t* path) -> void* {
-        // Use the REAL StaticFindObject (with proper path resolution) if available
+        // Prefer the discovered StaticFindObject (it has proper path resolution)
         if (s_realStaticFindObject) {
             auto fn = (FindObjFn)s_realStaticFindObject;
             void* result = nullptr;
@@ -1144,8 +1144,9 @@ static bool discoverAssetRegistry() {
     if (s_assetRegHelpersCDO)
         Hydro::logInfo("EngineAPI: AssetRegistryHelpers CDO at %p", s_assetRegHelpersCDO);
 
-    // Find GetAsset UFunction via UClass function chain (same as UE4SS's GetFunctionByNameInChain)
-    // This finds the CORRECT UFunction with the proper native Func pointer.
+    // Find GetAsset UFunction via the UClass function chain (same as
+    // UE4SS's GetFunctionByNameInChain). This gives us the UFunction
+    // with the intact native Func pointer.
     if (s_assetRegHelpersCDO) {
         void* cdoClass = nullptr;
         safeReadPtr((uint8_t*)s_assetRegHelpersCDO + UOBJ_CLASS, &cdoClass);
@@ -1223,7 +1224,7 @@ using StaticFindObjectFn = void*(__fastcall*)(void*, void*, const wchar_t*, bool
 void* findObject(const wchar_t* path) {
     if (!path) return nullptr;
 
-    // Try the REAL StaticFindObject first (handles /Game/ paths with path resolution)
+    // Prefer the discovered StaticFindObject (handles /Game/ path resolution)
     if (s_realStaticFindObject) {
         auto fn = (StaticFindObjectFn)s_realStaticFindObject;
         void* result = nullptr;
@@ -1494,6 +1495,10 @@ struct alignas(16) SpawnParams {
     void*    returnValue;       // 0x88 - OUT
 };
 #pragma pack(pop)
+
+void* getProcessEventAddress() {
+    return (void*)s_processEvent;
+}
 
 static bool callProcessEvent(void* obj, void* func, void* params) {
     if (!obj || !func) return false;

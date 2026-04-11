@@ -2,17 +2,18 @@
 
 #include <cstdint>
 
-/**
- * EngineAPI - HydroCore's engine reflection layer.
+/*
+ * EngineAPI: HydroCore's engine reflection layer.
  *
- * Pure C++. ZERO UE4SS headers. All engine interaction uses:
+ * Pure C++ with no UE4SS headers touched here. All engine interaction
+ * goes through:
  *   - Pattern scanning to discover function addresses
  *   - Raw vtable offsets for ProcessEvent (0x278)
  *   - Direct GUObjectArray iteration for object discovery
  *   - SEH wrappers for crash safety
  *
- * This is the foundation that mods will call through.
- * UE4SS is ONLY used in dllmain.cpp for DLL injection lifecycle.
+ * This is the foundation that mods call through. UE4SS is used in
+ * dllmain.cpp for the DLL injection lifecycle and nothing else.
  */
 
 namespace Hydro::Engine {
@@ -40,7 +41,7 @@ void* findObject(const wchar_t* path);
 
 /// Load an asset from a pak file by path (e.g., "/Game/BP_TestCube").
 /// Uses AssetRegistry::GetAssetByObjectPath -> GetAsset via ProcessEvent.
-/// This is the PROVEN path that UE4SS/BPModLoaderMod uses.
+/// Matches the dispatch path BPModLoaderMod follows.
 void* loadAsset(const wchar_t* assetPath);
 
 // Actor spawning
@@ -64,6 +65,10 @@ void* findProperty(void* uclass, const wchar_t* propName);
 
 /// Call ProcessEvent on an object with a function and params buffer.
 bool callFunction(void* obj, void* func, void* params);
+
+/// Return the discovered ProcessEvent function address (nullptr if not ready).
+/// Used by Hydro.Events for its inline hook.
+void* getProcessEventAddress();
 
 /// Read a pointer safely (returns false on access violation).
 bool readPtr(void* addr, void** out);

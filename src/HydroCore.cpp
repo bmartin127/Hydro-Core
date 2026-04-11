@@ -99,12 +99,8 @@ Core::~Core() {
 
 std::string Core::findGameDirectory() const {
     // Walk up from the DLL's location looking for hydro_mods.json.
-    // Typical UE5 packaged game layout:
-    //
-    //   GameRoot/
-    //     GameName.exe
-    //     hydro_mods.json                 (launcher writes this)
-    //     GameName/Binaries/Win64/ue4ss/Mods/HydroCore/dlls/main.dll
+    // The launcher drops that manifest in the game root next to the
+    // game's .exe, so finding it gives us the root.
 
     fs::path dir = getDllDirectory();
 

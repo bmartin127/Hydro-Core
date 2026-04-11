@@ -9,19 +9,21 @@
 #include "api/HydroAssets.h"
 #include "api/HydroWorld.h"
 #include "api/HydroEvents.h"
+#include "api/HydroRegistry.h"
+#include "registry/RegistryManager.h"
 #include <filesystem>
 #include <windows.h>
 
-/**
- * dllmain.cpp - UE4SS lifecycle hooks ONLY.
+/*
+ * dllmain.cpp: UE4SS lifecycle plumbing.
  *
- * UE4SS is used ONLY for:
+ * UE4SS is used for:
  *   - start_mod() / uninstall_mod() - DLL injection entry points
- *   - on_unreal_init() - notification that engine is ready
- *   - RegisterEngineTickPostCallback() - poll until world is ready
- *   - RC::Output::send() - log routing to UE4SS console
+ *   - on_unreal_init() - notification that the engine is ready
+ *   - RegisterEngineTickPostCallback() - polling until the world is ready
+ *   - RC::Output::send() - log routing into the UE4SS console
  *
- * ALL engine interaction goes through EngineAPI (pure C++, zero UE4SS).
+ * Everything that touches the engine itself lives in EngineAPI.
  */
 
 static void ue4ssLogCallback(Hydro::LogLevel level, const char* message) {
@@ -189,6 +191,14 @@ static void LoadMods() {
         }
     }
 
+    // Publish each mod's apiProvides to the registry manager so
+    // Hydro.Registry.create can validate ownership at script time.
+    for (size_t i = 0; i < mods.size(); i++) {
+        if (skipMod[i]) continue;
+        Hydro::RegistryManager::instance().setModProvides(
+            mods[i].manifest.id, mods[i].manifest.apiProvides);
+    }
+
     int loaded = 0;
     int skipped = 0;
 
@@ -201,8 +211,8 @@ static void LoadMods() {
         const auto& m = mod.manifest;
         Hydro::logInfo("Loading mod '%s' v%s (tier %d)", m.id.c_str(), m.version.c_str(), (int)m.tier);
 
-        // Auto-spawn actors ONLY for Blueprint-only mods (no scripts).
-        // Mods with scripts handle their own spawning via Hydro.Assets API.
+        // Auto-spawn actors for Blueprint-only mods (no scripts).
+        // Mods with scripts handle their own spawning via the Hydro.Assets API.
         if (m.hasActors() && !m.hasScripts()) {
             for (const auto& actorPath : m.actors) {
                 std::wstring widePath(actorPath.begin(), actorPath.end());
@@ -234,6 +244,7 @@ static void LoadMods() {
                     s_lua.registerModule("Hydro.Assets", Hydro::API::registerAssetsModule);
                     s_lua.registerModule("Hydro.World", Hydro::API::registerWorldModule);
                     s_lua.registerModule("Hydro.Events", Hydro::API::registerEventsModule);
+                    s_lua.registerModule("Hydro.Registry", Hydro::API::registerRegistryModule);
                 }
             }
             if (s_lua.isReady()) {
@@ -285,6 +296,14 @@ static void LoadMods() {
     }
 
     Hydro::logInfo("Mod loading complete: %d/%zu loaded, %d skipped (dependency/conflict)", loaded, mods.size(), skipped);
+
+    // Registry commit phase: fire on_commit for every registry now that all
+    // Tier 1 consumers have finished contributing entries.
+    if (s_lua.isReady()) {
+        Hydro::RegistryManager::instance().commitAll(s_lua.state());
+        Hydro::RegistryManager::instance().dumpAll();
+    }
+
     s_modsLoaded = true;
 }
 
