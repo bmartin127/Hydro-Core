@@ -15,8 +15,7 @@ namespace Hydro {
 
 // DLL path utility
 
-// Get the directory containing this DLL. More reliable than
-// current_path() which depends on how the host process was launched.
+// Get the directory containing this DLL.
 static fs::path getDllDirectory() {
 #ifdef _WIN32
     HMODULE hModule = nullptr;
@@ -38,8 +37,11 @@ static fs::path getDllDirectory() {
 
 static LogCallback s_callback = nullptr;
 
-// Fallback file logger - used when no callback is set (e.g. unit tests,
-// standalone runs). Writes HydroCore.log next to the DLL.
+static const Manifest* s_currentManifest = nullptr; // set by Core::initialize; read by API modules
+
+const Manifest* getCurrentManifest() { return s_currentManifest; }
+
+// Fallback file logger: writes HydroCore.log next to the DLL when no callback is set.
 static void fallbackLog(LogLevel level, const char* message) {
     static std::ofstream s_file;
     static bool s_opened = false;
@@ -94,14 +96,12 @@ Core::Core() {
 }
 
 Core::~Core() {
+    cleanupDeployedPaks(); // remove our symlinks so the game runs vanilla if HydroCore is absent
     logInfo("Core destroyed");
 }
 
 std::string Core::findGameDirectory() const {
-    // Walk up from the DLL's location looking for hydro_mods.json.
-    // The launcher drops that manifest in the game root next to the
-    // game's .exe, so finding it gives us the root.
-
+    // Walk up from the DLL until hydro_mods.json is found (up to 10 levels).
     fs::path dir = getDllDirectory();
 
     for (int i = 0; i < 10; i++) {
@@ -109,7 +109,7 @@ std::string Core::findGameDirectory() const {
             return dir.string();
         }
         fs::path parent = dir.parent_path();
-        if (parent == dir) break; // filesystem root
+        if (parent == dir) break;
         dir = parent;
     }
 
@@ -123,6 +123,7 @@ void Core::initialize(const std::string& gameRootHint) {
     }
 
     logInfo("=== Initialization Start ===");
+    logInfo("HydroCore build fingerprint: %s %s", __DATE__, __TIME__);
 
     try {
         // Determine game directory
@@ -139,6 +140,7 @@ void Core::initialize(const std::string& gameRootHint) {
         // Phase 1: Load the manifest
         if (!m_gameDirectory.empty()) {
             if (loadManifest()) {
+                s_currentManifest = m_manifest.get();
                 logInfo("Manifest loaded - profile: %s, mods: %zu",
                     m_manifest->getProfileName().c_str(),
                     m_manifest->getModCount());
@@ -153,8 +155,7 @@ void Core::initialize(const std::string& gameRootHint) {
                         logInfo("    %s [%s]", file.fileName.c_str(), file.fileType.c_str());
                     }
                 }
-                // Phase 4: Verify paks deployed by launcher
-                verifyPaks();
+                deployPaks();
             } else {
                 logInfo("No manifest - running without launcher mods");
             }
@@ -169,9 +170,7 @@ void Core::initialize(const std::string& gameRootHint) {
         logError("Initialization failed: unknown error");
     }
 
-    // Mark initialized even on failure - don't retry, the game should
-    // still run. Future phases can check m_manifest != nullptr.
-    m_initialized = true;
+    m_initialized = true; // mark even on failure - don't retry; game should still run
     logInfo("=== Initialization Complete ===");
 }
 
@@ -202,7 +201,7 @@ void Core::verifyPaks() {
 
     PakLoader loader;
     size_t found = loader.verifyDeployedPaks(m_gameDirectory);
-    logInfo("Pak verification: %zu/%zu Hydro paks found in HydroMods/", found, expectedPaks);
+    logInfo("Pak verification: %zu/%zu Hydro paks found in LogicMods/", found, expectedPaks);
     if (found < expectedPaks) {
         logWarn("Some paks missing - engine may not mount all mods");
     }
@@ -229,6 +228,19 @@ void Core::initPakLoader() {
 }
 
 void Core::executePakMounts() {
+    // Paks are deployed to LogicMods/ at construction time so UE's startup scan picks them up.
+    // Runtime mount is disabled by default (IoStore games seal FPackageStore before any runtime
+    // mount fires). Set HYDRO_RUNTIME_MOUNT=1 to enable the runtime path for experiments.
+    {
+        char buf[16] = {};
+        DWORD got = GetEnvironmentVariableA("HYDRO_RUNTIME_MOUNT", buf, sizeof(buf));
+        if (!(got > 0 && buf[0] == '1')) {
+            logInfo("Pak mount: relying on UE startup auto-mount (set HYDRO_RUNTIME_MOUNT=1 to opt into runtime mount)");
+            return;
+        }
+        logInfo("HYDRO_RUNTIME_MOUNT=1 - runtime pak mount active");
+    }
+
     if (!m_pakLoader || !m_pakLoader->isReady()) return;
     if (!m_manifest) return;
 
@@ -249,6 +261,142 @@ void Core::executePakMounts() {
         else logError("Mount failed: %s - %s", r.modId.c_str(), r.error.c_str());
     }
     logInfo("Mounting: %zu/%zu succeeded", m_pakLoader->getMountedCount(), paks.size());
+}
+
+// Pak deployment - symlink mods into Content/Paks/LogicMods/
+
+namespace {
+
+// Returns Content/Paks/LogicMods/, creating it if missing. Empty on failure.
+fs::path findHydroModsDir(const std::string& gameDir) {
+    fs::path dir(gameDir);
+    for (int i = 0; i < 5; i++) {
+        fs::path content = dir / "Content" / "Paks";
+        if (fs::is_directory(content)) {
+            fs::path target = content / "LogicMods";
+            std::error_code ec;
+            fs::create_directories(target, ec);
+            return target;
+        }
+        fs::path parent = dir.parent_path();
+        if (parent == dir) break;
+        dir = parent;
+    }
+    return {};
+}
+
+// Try to symlink src to dst; fall back to copy. Returns "symlink"/"copy"/"" on failure.
+const char* linkOrCopy(const fs::path& src, const fs::path& dst) {
+#ifdef _WIN32
+    if (CreateSymbolicLinkW(dst.c_str(), src.c_str(), 0)) {
+        return "symlink";
+    }
+#else
+    std::error_code sec;
+    fs::create_symlink(src, dst, sec);
+    if (!sec) return "symlink";
+#endif
+    std::error_code cec;
+    fs::copy_file(src, dst, fs::copy_options::overwrite_existing, cec);
+    return cec ? "" : "copy";
+}
+
+}  // namespace
+
+bool Core::cleanupDeployedPaks() {
+    if (m_gameDirectory.empty()) return false;
+    fs::path dir = findHydroModsDir(m_gameDirectory);
+    if (dir.empty()) return false;
+
+    int removed = 0;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file() && !entry.is_symlink()) continue;
+        std::string name = entry.path().filename().string();
+        // Match: legacy "Hydro_*", transient "pakchunk<N>-Hydro_*", and
+        // current "pakchunk<N>-Windows.*" where N ∈ [10000,99999] (our FNV-1a range).
+        bool isOurs = (name.rfind("Hydro_", 0) == 0) ||
+                      (name.find("-Hydro_") != std::string::npos);
+        if (!isOurs && name.rfind("pakchunk", 0) == 0) {
+            size_t end = 8;
+            while (end < name.size() && name[end] >= '0' && name[end] <= '9') end++;
+            if (end > 8) {
+                int n = atoi(name.substr(8, end - 8).c_str());
+                if (n >= 10000 && n <= 99999) isOurs = true;
+            }
+        }
+        if (!isOurs) continue;
+        std::error_code rmec;
+        fs::remove(entry.path(), rmec);
+        if (!rmec) removed++;
+    }
+    if (removed > 0) logInfo("Cleaned %d Hydro_* file(s) from LogicMods/", removed);
+    return true;
+}
+
+bool Core::deployPaks() {
+    if (!m_manifest || m_manifest->getModCount() == 0) return false;
+    if (m_gameDirectory.empty()) {
+        logWarn("Pak deploy skipped - no game directory");
+        return false;
+    }
+
+    fs::path target = findHydroModsDir(m_gameDirectory);
+    if (target.empty()) {
+        logWarn("Pak deploy skipped - couldn't locate Content/Paks/LogicMods/ (or HydroMods/)");
+        return false;
+    }
+
+    cleanupDeployedPaks(); // remove orphans from previous session
+
+    int linked = 0;
+    for (const auto& mod : m_manifest->getMods()) {
+        if (!mod.enabled) continue;
+        for (const auto& file : mod.files) {
+            if (file.fileType != "pak") continue;
+            fs::path pakSrc(file.filePath);
+            if (!fs::exists(pakSrc)) {
+                logWarn("Pak source missing: %s", file.filePath.c_str());
+                continue;
+            }
+            std::string baseStem = pakSrc.stem().string();
+
+            // Deploy .pak plus IoStore companions (.utoc, .ucas).
+            for (const char* ext : {"pak", "utoc", "ucas"}) {
+                fs::path sibling = pakSrc;
+                sibling.replace_extension(ext);
+                if (!fs::exists(sibling)) continue;
+
+                // Filename must start with "pakchunk<N>" so PakGetPakchunkIndex extracts N,
+                // which UE uses in GetShaderLibraryNameForChunk to auto-merge our shader archive.
+                // N = FNV-1a(mod.modId) mapped to [10000,99999] - MUST match hydro-cli build.rs.
+                uint32_t chunkIndex = 0x811C9DC5u;
+                for (unsigned char c : mod.modId) {
+                    chunkIndex ^= c;
+                    chunkIndex *= 0x01000193u;
+                }
+                chunkIndex = 10000u + (chunkIndex % 90000u);
+
+                std::string destName =
+                    "pakchunk" + std::to_string(chunkIndex) + "-Windows." + std::string(ext);
+                fs::path dest = target / destName;
+
+                std::error_code rmec;
+                fs::remove(dest, rmec);
+
+                const char* method = linkOrCopy(sibling, dest);
+                if (method[0]) {
+                    logInfo("Deployed %s (%s)", destName.c_str(), method);
+                    if (std::string(ext) == "pak") linked++;
+                } else {
+                    logError("Failed to deploy %s", destName.c_str());
+                }
+            }
+        }
+    }
+
+    logInfo("Pak deploy: %d pak(s) linked into LogicMods/", linked);
+    return linked > 0;
 }
 
 } // namespace Hydro

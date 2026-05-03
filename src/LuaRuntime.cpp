@@ -3,6 +3,7 @@
 #include "EngineAPI.h"
 #include "ModManifest.h"
 #include "LuaUObject.h"
+#include "api/HydroEvents.h"
 
 extern "C" {
 #include <lua.h>
@@ -151,6 +152,12 @@ void LuaRuntime::createTier1Environment(const std::string& modId) {
     lua_pushcfunction(L, l_safe_require);
     lua_setfield(L, -2, "require");
 
+    // Global wait(seconds) - yields the current coroutine. Every mod
+    // script runs as a coroutine, so scripts can call wait() at the top
+    // level to pause execution without blocking the game thread.
+    lua_pushcfunction(L, Hydro::API::globalWaitBinding);
+    lua_setfield(L, -2, "wait");
+
     // Store mod ID in the environment
     lua_pushstring(L, modId.c_str());
     lua_setfield(L, -2, "_MOD_ID");
@@ -179,6 +186,10 @@ void LuaRuntime::createTier2Environment(const std::string& modId) {
     // Override print
     lua_pushcfunction(L, l_hydro_print);
     lua_setfield(L, -2, "print");
+
+    // Global wait(seconds) - same as Tier 1, yields the current coroutine.
+    lua_pushcfunction(L, Hydro::API::globalWaitBinding);
+    lua_setfield(L, -2, "wait");
 
     // Store mod ID
     lua_pushstring(L, modId.c_str());
@@ -232,12 +243,43 @@ bool LuaRuntime::executeModScript(const std::string& modId, const std::string& s
     // Remove env from under the chunk
     lua_remove(m_state, -2);
 
-    // Execute
-    int execResult = lua_pcall(m_state, 0, 0, 0);
+    // Execute in a coroutine so the script can call wait() to yield. Non-
+    // yielding scripts complete on first resume with no additional cost;
+    // scripts that wait get registered with the Hydro.Events scheduler.
+    //
+    // Stack manipulation: the loaded chunk is currently at top-of-stack.
+    // lua_newthread pushes the new thread on top of the chunk. We then
+    // swap them (so the chunk is on top) before xmoving the chunk into
+    // the coroutine's stack. Finally, pin the thread in the registry so
+    // GC doesn't collect the coroutine while it's suspended.
+    // stack: [..., chunk]
+    lua_State* co = lua_newthread(m_state);
+    // stack: [..., chunk, thread]
+    lua_insert(m_state, -2);
+    // stack: [..., thread, chunk]
+    lua_xmove(m_state, co, 1);
+    // stack: [..., thread]          co stack: [chunk]
+    int threadRef = luaL_ref(m_state, LUA_REGISTRYINDEX);
+    // thread is pinned in the registry and popped from the main stack.
+
+    int execResult = lua_resume(co, 0);
+    if (execResult == LUA_YIELD) {
+        // Script called wait() - extract seconds and hand off to scheduler.
+        double seconds = 0;
+        if (lua_isnumber(co, -1)) seconds = lua_tonumber(co, -1);
+        lua_pop(co, 1);
+        Hydro::API::registerYieldedCoroutine(m_state, co, seconds, modId, threadRef);
+        logInfo("LuaRuntime: [%s] Script yielded after %.3fs (suspended)",
+                modId.c_str(), seconds);
+        return true;
+    }
+
+    // Completed or errored - release the registry ref in either case.
+    luaL_unref(m_state, LUA_REGISTRYINDEX, threadRef);
+
     if (execResult != 0) {
-        const char* err = lua_tostring(m_state, -1);
+        const char* err = lua_tostring(co, -1);
         logError("LuaRuntime: [%s] Runtime error: %s", modId.c_str(), err ? err : "unknown");
-        lua_pop(m_state, 1);
         return false;
     }
 

@@ -23,6 +23,12 @@ void logInfo(const char* fmt, ...);
 void logWarn(const char* fmt, ...);
 void logError(const char* fmt, ...);
 
+// Globally-accessible pointer to the current loaded manifest. Set by
+// Core::initialize after a successful load; nullptr before that. Lets
+// API modules (HydroNet, etc.) read the active mod set without taking
+// a Core& reference through every registration path.
+const class Manifest* getCurrentManifest();
+
 // Core loader
 
 class Core {
@@ -38,6 +44,17 @@ public:
     void verifyPaks();
     void initPakLoader();     // Heavy scan - call from on_unreal_init (any thread)
     void executePakMounts();  // Light mount call - call from on_update (game thread)
+
+    // Symlink each enabled mod's pak triple (.pak/.utoc/.ucas) into the
+    // game's `Content/Paks/HydroMods/` so UE auto-mounts them at engine
+    // init. Naming: `Hydro_<modId>_<base>_P.<ext>` - the `_P` suffix bumps
+    // pak load priority above the game's own pak. Called from initialize()
+    // BEFORE engine pak scan runs (UE4SS injects HydroCore early enough).
+    bool deployPaks();
+
+    // Remove every `Hydro_*` file from `Content/Paks/HydroMods/`. Called
+    // at shutdown so the game runs vanilla when HydroCore isn't loaded.
+    bool cleanupDeployedPaks();
 
     // Access manifest for mod loading
     const Manifest* getManifest() const { return m_manifest.get(); }

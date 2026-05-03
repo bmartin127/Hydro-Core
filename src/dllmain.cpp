@@ -10,6 +10,8 @@
 #include "api/HydroWorld.h"
 #include "api/HydroEvents.h"
 #include "api/HydroRegistry.h"
+#include "api/HydroReflect.h"
+#include "api/HydroNet.h"
 #include "registry/RegistryManager.h"
 #include <filesystem>
 #include <windows.h>
@@ -245,6 +247,8 @@ static void LoadMods() {
                     s_lua.registerModule("Hydro.World", Hydro::API::registerWorldModule);
                     s_lua.registerModule("Hydro.Events", Hydro::API::registerEventsModule);
                     s_lua.registerModule("Hydro.Registry", Hydro::API::registerRegistryModule);
+                    s_lua.registerModule("Hydro.Reflect", Hydro::API::registerReflectModule);
+                    s_lua.registerModule("Hydro.Net", Hydro::API::registerNetModule);
                 }
             }
             if (s_lua.isReady()) {
@@ -317,7 +321,7 @@ public:
     HydroCoreMod() : CppUserModBase() {
         ModName = STR("HydroCore");
         ModVersion = STR("0.1.0");
-        ModDescription = STR("Hydro Modding Platform - Core Loader");
+        ModDescription = STR("Hydro - Core Loader");
         ModAuthors = STR("Hydro Team");
 
         Hydro::setLogCallback(ue4ssLogCallback);
@@ -347,11 +351,22 @@ public:
             }
         }
 
-        // Poll each tick - load mods as soon as the world is ready
+        // Poll each tick - load mods, then service background tasks
         RC::Unreal::Hook::RegisterEngineTickPostCallback([](RC::Unreal::UEngine*, float) {
-            if (!s_modsLoaded) {
+                if (!s_modsLoaded) {
                 LoadMods();
             }
+            // Process reflection dump batches (no-op if no dump active)
+            Hydro::API::tickDump();
+            // Expire trace listeners (no-op if none active)
+            Hydro::API::tickTraces();
+            // Pump yielded coroutines. Without this, scripts that wait()
+            // can stall on title/load screens where ProcessEvent is dormant.
+            Hydro::API::tickEvents();
+            // (Deferred AR discovery retry intentionally NOT called here -
+            // discoverAssetRegistry walks GUObjectArray which freezes the
+            // game thread for ~1s per call. Needs a faster scan or off-
+            // thread approach before re-enabling.)
         });
     }
 

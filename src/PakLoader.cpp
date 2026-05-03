@@ -1,5 +1,6 @@
 #include "PakLoader.h"
 #include "HydroCore.h"
+#include "EngineAPI.h"
 #include "SEH.h"
 #include <Unreal/FString.hpp>
 
@@ -26,9 +27,7 @@ static bool safeCallGetName(void* obj, const wchar_t** out) {
     });
 }
 
-// The delegate object layout (UE 4.27+ / UE5):
-// {void* idk1, void* idk2, void* idk3, FPakPlatformFile* pak, MountFn fn}
-// MountFn = bool (*)(FPakPlatformFile*, FString&, uint32_t)
+// UE 4.27+ / UE5 delegate object layout.
 struct MountDelegate {
     void* pad1;
     void* pad2;
@@ -72,20 +71,14 @@ static GameModule findGameModule() {
 #endif
 }
 
-// Find Mount delegate via destructor AOB
-// Same approach as pak_reloader: scan for FPakPlatformFile destructor,
-// walk it for mov rcx, [rip+offset] instructions to find delegate globals.
-
+// Scan for FPakPlatformFile destructor, walk it for mov rcx, [rip+xx]
+// instructions to recover the global Mount delegate object.
 static MountDelegate* FindMountDelegate(GameModule gm, void** outPak, void** outFn) {
     uint8_t* base = gm.base;
     size_t size = gm.size;
 
-    // Destructor AOB patterns from patternsleuth (UE 4.27+ / UE5)
-    // Pattern: 40 53 56 57 48 83 EC 20 48 8D 05 ?? ?? ?? ?? 4C 89 74 24 50 48 89 01 48 8B F9 E8
     const char* dtorPatterns[] = {
-        // UE 4.27+ / UE5
         "40 53 56 57 48 83 EC 20 48 8D 05 ?? ?? ?? ?? 4C 89 74 24 50 48 89 01 48 8B F9 E8",
-        // Alternate with different register saves
         "40 53 56 57 48 83 EC 20 48 8D 05 ?? ?? ?? ?? 48 89 01 48 8B F9",
     };
 
@@ -122,9 +115,8 @@ static MountDelegate* FindMountDelegate(GameModule gm, void** outPak, void** out
     if (!dtorAddr) {
         logInfo("PakLoader: Standard destructor pattern not found - trying vtable-based search...");
 
-        // Alternative: we can find the destructor by searching for code that
-        // sets the vtable pointer. The destructor does: lea rax, [vtable]; mov [rcx], rax
-        // First find the vtable via the existing L"PakFile" string approach
+        // Fallback path: find the FPakPlatformFile vtable via its L"PakFile" name
+        // string, then pull the destructor out of vtable[0].
         const uint8_t pakFileStr[] = {'P',0,'a',0,'k',0,'F',0,'i',0,'l',0,'e',0,0,0};
         uint8_t* strAddr = nullptr;
         for (size_t i = 0; i + sizeof(pakFileStr) <= size; i++) {
@@ -162,15 +154,13 @@ static MountDelegate* FindMountDelegate(GameModule gm, void** outPak, void** out
                                 head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7]);
                         }
 
-                        // MSVC deleting destructor typically calls the real destructor
-                        // then optionally calls operator delete. The real destructor
-                        // might be at a call target inside vtable[0].
-                        // Try vtable[0] first, then look for a call inside it.
+                        // vtable[0] is the MSVC deleting destructor, which is sometimes
+                        // a thunk that calls the actual destructor then operator delete.
+                        // Use vtable[0] directly, but if it contains an early call, follow
+                        // the target too.
                         dtorAddr = dtor;
                         logInfo("PakLoader: Using vtable[0] as destructor");
 
-                        // Also check if vtable[0] is a tiny thunk that calls the real dtor
-                        // Look for an early 'call' or 'jmp' instruction
                         for (int off = 0; off < 32; off++) {
                             if (dtor[off] == 0xE8) { // call rel32
                                 int32_t rel = *(int32_t*)(dtor + off + 1);
@@ -230,7 +220,6 @@ static MountDelegate* FindMountDelegate(GameModule gm, void** outPak, void** out
                     if (safeReadBytes(resolved, (uint8_t*)&delegateObj, 8) && delegateObj) {
                         logInfo("PakLoader: MountPak delegate at %p", delegateObj);
 
-                        // Dump raw bytes to understand layout
                         uint8_t raw[64];
                         if (safeReadBytes(delegateObj, raw, 64)) {
                             for (int s = 0; s < 8; s++) {
@@ -241,16 +230,13 @@ static MountDelegate* FindMountDelegate(GameModule gm, void** outPak, void** out
                             }
                         }
 
-                        // In pak_reloader V427 layout: slot[3]=pak, slot[4]=fn
-                        // But UE5.5 might differ. Try to identify:
-                        // - The fn slot points into exe code
-                        // - The pak slot points to heap (the FPakPlatformFile object)
+                        // Identify slots: fn points into exe code, pak points
+                        // to a heap object whose vtable name is "PakFile".
                         void* foundPak = nullptr;
                         void* foundFn = nullptr;
                         for (int s = 0; s < 8; s++) {
                             void* val = *(void**)(raw + s * 8);
                             bool inExe = ((uint8_t*)val >= base && (uint8_t*)val < base + size);
-                            // The mount fn should look like executable code (common prologue bytes)
                             if (inExe && !foundFn) {
                                 uint8_t fnHead[4];
                                 if (safeReadBytes(val, fnHead, 4)) {
@@ -309,30 +295,29 @@ bool PakLoader::initialize() {
     m_pakPlatformFile = foundPak;
     m_mountFunc = foundFn;
 
-    // Also find HandleMountPakDelegate via "Mounting pak file" string - this is a
-    // known-working function that returns false instead of crashing
-    logInfo("PakLoader: Also searching for HandleMountPakDelegate via string...");
+    // Resolve the inner FPakPlatformFile::Mount via its "Mounting pak file"
+    // log string for diagnostics. The raw delegate fn is the outer
+    // HandleMountPakDelegate wrapper which also broadcasts OnPakFileMounted2;
+    // mounting via the inner fn skips the broadcast and AR never indexes.
+    // Keep using the outer wrapper for the actual mount.
     const uint8_t mountStr[] = {
         'M',0,'o',0,'u',0,'n',0,'t',0,'i',0,'n',0,'g',0,' ',0,
         'p',0,'a',0,'k',0,' ',0,'f',0,'i',0,'l',0,'e',0
     };
     for (size_t i = 0; i + sizeof(mountStr) <= gm.size; i++) {
         if (memcmp(gm.base + i, mountStr, sizeof(mountStr)) == 0) {
-            // Find lea referencing this string
             for (size_t j = 0; j + 7 < gm.size; j++) {
                 if ((gm.base[j] != 0x48 && gm.base[j] != 0x4C) || gm.base[j+1] != 0x8D) continue;
                 if ((gm.base[j+2] & 0xC7) != 0x05 && (gm.base[j+2] & 0xC7) != 0x0D) continue;
                 int32_t disp = *(int32_t*)(gm.base + j + 3);
                 if (gm.base + j + 7 + disp == gm.base + i) {
-                    // Walk back to function start
                     uint8_t* funcStart = gm.base + j;
                     for (int back = 1; back < 8192; back++) {
                         if (funcStart[-1] == 0xCC) break;
                         funcStart--;
                     }
-                    logInfo("PakLoader: HandleMountPakDelegate at exe+0x%zX", (size_t)(funcStart - gm.base));
-                    // Use this instead of delegate fn - it doesn't crash
                     m_mountFunc = funcStart;
+                    logInfo("PakLoader: inner Mount fn at exe+0x%zX - using this", (size_t)(funcStart - gm.base));
                     goto found_string_mount;
                 }
             }
@@ -340,6 +325,11 @@ bool PakLoader::initialize() {
         }
     }
     found_string_mount:
+    if (m_mountFunc == foundFn) {
+        logInfo("PakLoader: String anchor not found - falling back to raw delegate fn at %p (may crash)", m_mountFunc);
+    } else {
+        logInfo("PakLoader: Mount fn resolved to anchored inner fn at %p", m_mountFunc);
+    }
 
     logInfo("PakLoader: Ready - pak=%p, mount=%p", m_pakPlatformFile, m_mountFunc);
     return true;
@@ -355,11 +345,14 @@ PakMountResult PakLoader::mountPak(const std::string& pakPath, const std::string
         return result;
     }
 
-    // Build FString using UE4SS's FString (allocates via GMalloc)
+    // FString allocated via GMalloc.
     std::wstring wide(pakPath.begin(), pakPath.end());
     RC::Unreal::FString fstr(wide.c_str());
 
     logInfo("PakLoader: Mounting %s (order=%d)", pakPath.c_str(), priority);
+
+    uint8_t snapBefore[320] = {};
+    safeReadBytes(m_pakPlatformFile, snapBefore, 320);
 
     bool crashed = false;
     void* pakFile = nullptr;
@@ -367,17 +360,35 @@ PakMountResult PakLoader::mountPak(const std::string& pakPath, const std::string
 
     logInfo("PakLoader: Result: %p (crashed=%d)", pakFile, crashed);
 
+    // Detect MountedPaks list growth by scanning for int32 +1 increments.
+    {
+        uint8_t snapAfter[320] = {};
+        bool anyChange = false;
+        if (safeReadBytes(m_pakPlatformFile, snapAfter, 320)) {
+            for (int off = 0; off + 4 <= 320; off += 4) {
+                int32_t bef = *(int32_t*)(snapBefore + off);
+                int32_t aft = *(int32_t*)(snapAfter + off);
+                if (aft == bef + 1 && bef >= 0 && bef < 1000) {
+                    logInfo("PakLoader: FPakPlatformFile+0x%02X: %d->%d (count increment - pak likely in MountedPaks)", off, bef, aft);
+                    anyChange = true;
+                }
+            }
+        }
+        if (!anyChange)
+            logInfo("PakLoader: FPakPlatformFile snapshot: no TArray count change detected (pak may NOT be in MountedPaks)");
+    }
+
     if (crashed) { result.error = "Mount crashed"; return result; }
     if (pakFile) {
         result.success = true; m_mountedCount++;
         logInfo("PakLoader: Mount returned success");
     } else {
-        // In IoStore games, Mount returns false because there's no companion .utoc,
-        // BUT the pak is still added to the PakFiles list internally.
-        // The mount actually succeeded - just the IoStore check failed.
+        // IoStore games return null with no companion .utoc, but the pak is
+        // still on the internal PakFiles list - count as mounted.
         result.success = true; m_mountedCount++;
         logInfo("PakLoader: Mount returned null (IoStore check failed) - pak may still be mounted");
     }
+
     return result;
 }
 

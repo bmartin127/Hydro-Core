@@ -9,7 +9,7 @@
 ///   - Adding creatures? Use Hydro.SN2.Creatures.register() instead.
 ///   - Adding items? Use Hydro.SN2.Items.register() instead.
 ///   Specific APIs enable conflict detection, multiplayer sync, and
-///   survive game updates. See CONTRIBUTING_TIER2.md for details.
+///   survive game updates.
 ///
 /// @depends EngineAPI (StaticLoadObject, AssetRegistry, ProcessEvent)
 /// @engine_systems AssetRegistry, GameplayStatics, UWorld
@@ -118,11 +118,42 @@ static int l_assets_spawn(lua_State* L) {
     double z = luaL_optnumber(L, 4, 0.0);
 
     std::wstring widePath = toWide(path);
-    void* actorClass = Engine::loadAsset(widePath.c_str());
-    if (!actorClass)
-        actorClass = Engine::findObject(widePath.c_str());
 
-    if (!actorClass) {
+    // Three-tier lookup to handle every asset origin:
+    //   1. AssetRegistry::GetAsset - fast, works for assets the game was
+    //      packaged with (asset registry knows about them at engine init).
+    //   2. StaticFindObject - catches already-loaded packages the registry
+    //      might not have cached but that are live in memory.
+    //   3. StaticLoadObject - actively loads the package from disk,
+    //      including from runtime-mounted mod paks whose contents were
+    //      never in the original game's AssetRegistry. This is the tier
+    //      that makes runtime mod content-loading actually work.
+    //
+    // Validate each tier: on hosts where the UFunction layout discovery
+    // misfires (e.g. Palworld's forked engine), `loadAsset` can return a
+    // bogus value (an FName index packed as void*). Real x64 user-mode heap
+    // allocations live above 0x100000000 (4 GB); anything below that is an
+    // FName index or other non-pointer integer and must be discarded so
+    // the cascade falls through to the next tier.
+    auto isValid = [](void* p) { return p && (uintptr_t)p > 0x100000000ULL; };
+    // Log each tier's result so we can pinpoint which one (if any) is
+    // returning a usable UClass on the current host.
+    void* actorClass = Engine::loadAsset(widePath.c_str());
+    logInfo("[Hydro.Assets] tier1 loadAsset('%s') = %p (valid=%d)",
+            path, actorClass, isValid(actorClass) ? 1 : 0);
+    if (!isValid(actorClass)) {
+        actorClass = Engine::findObject(widePath.c_str());
+        logInfo("[Hydro.Assets] tier2 findObject('%s') = %p (valid=%d)",
+                path, actorClass, isValid(actorClass) ? 1 : 0);
+    }
+    if (!isValid(actorClass)) {
+        actorClass = Engine::loadObject(widePath.c_str());
+        std::string tier3Name = isValid(actorClass) ? Engine::getObjectName(actorClass) : std::string("<invalid>");
+        logInfo("[Hydro.Assets] tier3 loadObject('%s') = %p name='%s' (valid=%d)",
+                path, actorClass, tier3Name.c_str(), isValid(actorClass) ? 1 : 0);
+    }
+
+    if (!isValid(actorClass)) {
         logWarn("[Hydro.Assets] Class not found: %s", path);
         lua_pushnil(L);
         return 1;

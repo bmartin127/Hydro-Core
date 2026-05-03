@@ -17,4 +17,8 @@ void pushUObject(lua_State* L, void* ptr);
 /// Returns the raw void* pointer, or nullptr.
 void* checkUObject(lua_State* L, int idx);
 
+/// Push a property's value onto the Lua stack. Reads from the object
+/// at the property's offset and converts to the appropriate Lua type.
+void pushPropertyValue(lua_State* L, void* obj, void* prop);
+
 } // namespace Hydro::Lua

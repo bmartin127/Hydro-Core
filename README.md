@@ -1,6 +1,6 @@
 # HydroCore
 
-In-game mod loader for Hydro, a modding platform for Subnautica 2. UE4SS is
+In-game mod loader for Hydro on Subnautica 2. UE4SS is
 used as a bootstrapper for the initial DLL injection; everything past that
 runs through HydroCore's own pure-C++ engine reflection layer, so the loader
 isn't coupled to UE4SS APIs and can be ported off of it later without

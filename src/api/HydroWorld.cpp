@@ -9,7 +9,7 @@
 ///   - Finding creatures? Use Hydro.SN2.Creatures.getAll() instead.
 ///   - Querying game state? Use the appropriate game-specific module.
 ///   Generic API is for novel mechanics, debugging, and cases not yet
-///   covered by specific registries. See CONTRIBUTING_TIER2.md.
+///   covered by specific registries.
 ///
 /// @depends EngineAPI (GUObjectArray, StaticFindObject, UWorld)
 /// @engine_systems GUObjectArray, UWorld
@@ -149,6 +149,65 @@ static int l_world_getGameplayStatics(lua_State* L) {
     return 1;
 }
 
+// World.getPlayer / getPlayerPawn / findAllOfClass
+//
+// These route through UE's own UGameplayStatics functions instead of
+// scanning GUObjectArray. They're the preferred way to find the player
+// and iterate typed actors - faster AND more stable across engine
+// versions than our generic `findFirstOf`/`findAllOf` name-scan API.
+
+/// Get the local player's character using UE's `GetPlayerCharacter`.
+/// @param index number? - Player index, defaults to 0 (local player)
+/// @returns UObject - The player ACharacter, or nil
+/// @example
+/// local World = require("Hydro.World")
+/// local player = World.getPlayer()
+static int l_world_getPlayer(lua_State* L) {
+    int index = (int)luaL_optinteger(L, 1, 0);
+    Lua::pushUObject(L, Engine::getPlayerCharacter(index));
+    return 1;
+}
+
+/// Get the local player's pawn using UE's `GetPlayerPawn`.
+/// @param index number? - Player index, defaults to 0
+/// @returns UObject - The player APawn, or nil
+static int l_world_getPlayerPawn(lua_State* L) {
+    int index = (int)luaL_optinteger(L, 1, 0);
+    Lua::pushUObject(L, Engine::getPlayerPawn(index));
+    return 1;
+}
+
+/// Find every actor of the given class via UE's `GetAllActorsOfClass`.
+/// @param classOrPath string|UObject - Either a UClass userdata or a path string
+/// @param maxResults number? - Cap on returned actor count (default 256)
+/// @returns table - Array of matching actors
+static int l_world_findAllOfClass(lua_State* L) {
+    void* uclass = nullptr;
+    if (lua_isstring(L, 1)) {
+        const char* path = lua_tostring(L, 1);
+        uclass = Engine::findObject(toWide(path).c_str());
+    } else {
+        uclass = Lua::checkUObject(L, 1);
+    }
+    int maxResults = (int)luaL_optinteger(L, 2, 256);
+    if (maxResults > 4096) maxResults = 4096;
+    if (maxResults < 1) maxResults = 1;
+
+    void* stackBuf[256];
+    void** results = (maxResults <= 256) ? stackBuf : new void*[maxResults];
+
+    int count = uclass ? Engine::getAllActorsOfClass(uclass, results, maxResults) : 0;
+
+    lua_createtable(L, count, 0);
+    for (int i = 0; i < count; i++) {
+        Lua::pushUObject(L, results[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+
+    if (maxResults > 256) delete[] results;
+    return 1;
+}
+
 // Module registration
 
 static const luaL_Reg world_functions[] = {
@@ -156,6 +215,9 @@ static const luaL_Reg world_functions[] = {
     {"findAllOf",           l_world_findAllOf},
     {"getWorld",            l_world_getWorld},
     {"getGameplayStatics",  l_world_getGameplayStatics},
+    {"getPlayer",           l_world_getPlayer},
+    {"getPlayerPawn",       l_world_getPlayerPawn},
+    {"findAllOfClass",      l_world_findAllOfClass},
     {nullptr,               nullptr}
 };
 

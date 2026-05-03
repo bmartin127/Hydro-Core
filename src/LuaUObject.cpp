@@ -21,7 +21,7 @@ struct UObjectUD {
 
 // Type dispatch: read a property value and push to Lua
 
-static void pushPropertyValue(lua_State* L, void* obj, void* prop) {
+void pushPropertyValue(lua_State* L, void* obj, void* prop) {
     using namespace Engine;
     const auto& types = getPropertyTypeNames();
     uint32_t typeId = getPropertyTypeNameIndex(prop);
@@ -148,11 +148,10 @@ static int uobject_call_function(lua_State* L) {
     void* obj = lua_touserdata(L, lua_upvalueindex(1));
     void* fn = lua_touserdata(L, lua_upvalueindex(2));
 
-    // Read ParmsSize from UFunction
-    uint16_t parmsSize = 0;
-    memcpy(&parmsSize, (uint8_t*)fn + Engine::UFUNC_PARMS_SIZE, 2);
-    uint16_t retOffset = 0;
-    memcpy(&retOffset, (uint8_t*)fn + Engine::UFUNC_RET_VAL_OFFSET, 2);
+    // Derive ParmsSize / RetOffset from the UFunction's parameter chain
+    // (Layer 3) - robust against UE-version layout shifts.
+    uint16_t parmsSize = Engine::getUFunctionParmsSize(fn);
+    uint16_t retOffset = Engine::getUFunctionRetOffset(fn);
 
     // Allocate param buffer
     uint8_t* params = (uint8_t*)alloca(parmsSize > 0 ? parmsSize : 8);

@@ -15,6 +15,8 @@ add_library(${TARGET} SHARED
     api/HydroWorld.cpp
     api/HydroEvents.cpp
     api/HydroRegistry.cpp
+    api/HydroReflect.cpp
+    api/HydroNet.cpp
     api/ModuleRegistry.cpp
 )
 
@@ -29,3 +31,10 @@ target_include_directories(${TARGET} PRIVATE
 
 target_link_libraries(${TARGET} PUBLIC UE4SS)
 target_link_libraries(${TARGET} PRIVATE "${LUAJIT_DIR}/lua51.lib")
+
+# Zydis - x86-64 disassembler used by installInlineHookAt() for correct
+# prologue decoding (including rip-relative instruction relocation). The
+# library is pulled in as a transitive dep of PolyHook via UE4SS's deps
+# tree; we link directly so our own hooking logic can use it without
+# taking on PolyHook's full framework.
+target_link_libraries(${TARGET} PRIVATE Zydis::Zydis)
