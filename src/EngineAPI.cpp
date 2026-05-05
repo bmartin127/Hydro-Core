@@ -1,5 +1,6 @@
 #include "EngineAPI.h"
 #include "HydroCore.h"
+#include "RawFunctions.h"
 #include "SEH.h"
 #include <cstdio>
 #include <cstring>
@@ -17,9 +18,14 @@
 /*
  * EngineAPI: pure C++ engine reflection layer. No UE4SS headers touched here.
  *
- * Bootstrap: find game module -> pattern-scan GUObjectArray / StaticLoadObject /
- * FName pool -> extract ProcessEvent from vtable[79] -> locate UWorld and
- * GameplayStatics CDO -> ready to spawn actors and call UFunctions.
+ * Bootstrap sequence:
+ *   1. Find game module (largest loaded DLL/exe)
+ *   2. Pattern scan for GUObjectArray via the "Unable to add more objects" string
+ *   3. Pattern scan for StaticLoadObject via the "Failed to find object" string
+ *   4. Pattern scan for FName::ToString via the "None" string
+ *   5. Get ProcessEvent from the first UObject's vtable at offset 0x278
+ *   6. Iterate GUObjectArray to find UWorld, GameplayStatics CDO, spawn UFunctions
+ *   7. Ready to spawn actors via ProcessEvent
  */
 
 namespace Hydro::Engine {
@@ -93,6 +99,7 @@ static uint8_t* walkToFuncStart(uint8_t* addr, int maxBack = 16384) {
 }
 
 // Forward declarations
+static void seedAndResolveRawFunctions();
 static bool findFNameConstructor();
 static bool discoverAssetRegistry();
 static bool discoverConvNameToString();
@@ -102,7 +109,9 @@ static bool callProcessEvent(void* obj, void* func, void* params);
 static void* findObjectViaScan(const wchar_t* path);
 static int readPoolEntryRaw(uint32_t comparisonIndex, char* buf, int bufSize, bool* isWide);
 static void staticLoadObjectCrashed(bool wasFromCache);
-// True after a fatal SLO crash - stops re-entry and invalidates cache.
+// Set to true after a fatal init failure (SLO sanity-test crash). Stops
+// init from re-running in the same process - cached pointer is bad and
+// retrying would crash again. Cache file is invalidated for next launch.
 static bool s_initFatallyFailed = false;
 
 // Cached state
@@ -110,6 +119,7 @@ static bool s_initFatallyFailed = false;
 static bool s_ready = false;
 static GameModule s_gm = {};
 
+// FNamePool state (declared early - used by cache load/save and pool discovery)
 static bool s_poolReady = false;
 static void* s_fnamePool = nullptr;
 static int s_poolBlocksOffset = -1;
@@ -118,6 +128,7 @@ static int s_poolBlocksOffset = -1;
 static void* s_guObjectArray = nullptr;     // FUObjectArray*
 static void* s_staticLoadObject = nullptr;  // StaticLoadObject function
 
+// Discovered via ProcessEvent (vtable offset)
 using ProcessEventFn = void(__fastcall*)(void*, void*, void*);
 static ProcessEventFn s_processEvent = nullptr;
 
@@ -130,28 +141,36 @@ static void* s_getPlayerCharacterFunc = nullptr; // GameplayStatics.GetPlayerCha
 static void* s_getPlayerPawnFunc = nullptr;      // GameplayStatics.GetPlayerPawn UFunction*
 static void* s_getAllActorsOfClassFunc = nullptr; // GameplayStatics.GetAllActorsOfClass UFunction*
 
-// UStruct::SuperStruct offset; -1 until discovered (callers fall back to 0x40).
+// UStruct::SuperStruct offset, discovered at init via an AActor->Object probe.
+// -1 until discovery runs; callers fall back to the 0x40 UE 5.5 default.
 static int s_superOffset = -1;
 
+// AssetRegistry loading (same dispatch path BPModLoaderMod uses)
 static void* s_fnameConstructor = nullptr;     // FName(const TCHAR*, EFindName) function
 static void* s_assetRegHelpersCDO = nullptr;   // Default__AssetRegistryHelpers
 static void* s_getAssetFunc = nullptr;         // AssetRegistryHelpers:GetAsset UFunction
 static void* s_assetRegImpl = nullptr;         // AssetRegistry implementation object
 static void* s_getByPathFunc = nullptr;        // AssetRegistry:GetAssetByObjectPath UFunction
 
+// Variables used by both cache code and pattern scans
 static void* s_realStaticFindObject = nullptr;
 static void* s_loadPackage = nullptr;
 static void* s_staticFindObject = nullptr;
-static void* s_staticFindObjectFast = nullptr;
-static void* s_openShaderLibrary = nullptr;
-static void* s_gmalloc = nullptr;
+static void* s_staticFindObjectFast = nullptr;   // StaticFindObjectFast (useful reflection anchor)
+static void* s_openShaderLibrary = nullptr;      // FShaderCodeLibrary::OpenLibrary - register a mounted pak's shader archive
+static void* s_gmalloc = nullptr;                // UE's global FMalloc* (GMalloc) - needed to allocate UE-owned buffers
 
-// Forward decl: clears UFunction parameter layout cache after Layer 2 re-derives offsets.
+// Forward decl: drops every cached UFunction parameter layout so subsequent
+// calls re-derive via the (now-correct) Layer 2 offsets. Defined later
+// alongside the layout cache itself.
 static void clearUFuncLayoutCache();
 
-// Discovered struct field offsets. -1 = not yet discovered; callers fall back to hardcoded.
-// FField/UStruct chain-walk offsets are probed first (UE 5.1 forks shift them by +8
-// vs. stock 5.5); FProperty internal offsets are probed after the chain walk works.
+// Layer 2 - discovered struct layout. Defined early so the scan cache
+// load/save can persist it. Real probing happens in discoverPropertyLayout()
+// further down. -1 fields = not yet discovered, fall back to hardcoded.
+// Includes the FField/UStruct chain-walk offsets too: Palworld's UE 5.1.x
+// fork shifts these by +8 bytes vs. stock UE 5.5, so even findProperty
+// needs the discovered values to walk an FProperty chain at all.
 struct PropertyLayoutCache {
     // FField/UStruct chain-walk offsets (probed first; needed to do anything else)
     int32_t childPropsOffset = -1;   // UStruct::ChildProperties (FField*)
@@ -166,19 +185,21 @@ struct PropertyLayoutCache {
 };
 static PropertyLayoutCache s_layout;
 
-// Pattern scan cache: stores offsets relative to module base. Invalidated
-// when the binary size changes (game update). Skips the ~6s pattern scan.
+// Pattern scan cache
+// Caches function offsets (relative to game module base) so we skip the
+// expensive 6+ second pattern scan on subsequent launches.
+// Cache is invalidated when the game binary size changes (i.e., game update).
 
 struct ScanCache {
-    uint32_t magic;                  // bumped when layout changes
-    size_t moduleSize;               // cache key
+    uint32_t magic;                  // bumped whenever layout changes
+    size_t moduleSize;               // Game module size - cache key
     ptrdiff_t staticLoadObject;      // StaticLoadObject offset from base
     ptrdiff_t fnameConstructor;      // FName constructor offset from base
     ptrdiff_t guObjectArray;         // GUObjectArray offset from base
     ptrdiff_t realStaticFindObject;  // Real StaticFindObject offset
     ptrdiff_t loadPackage;           // LoadPackageInternal offset
-    ptrdiff_t fnamePool;             // FNamePool offset (0 = not cached)
-    int32_t   poolBlocksOffset;      // Blocks[] offset within FNamePool
+    ptrdiff_t fnamePool;             // FNamePool offset from base (0 = not cached)
+    int32_t   poolBlocksOffset;      // Blocks[] offset within FNamePool struct
     ptrdiff_t staticFindObjectFast;  // StaticFindObjectFast offset
     ptrdiff_t openShaderLibrary;     // FShaderCodeLibrary::OpenLibrary offset
     // Layer 2/4 discovered struct field offsets (-1 = not yet discovered)
@@ -190,6 +211,8 @@ struct ScanCache {
     int32_t fpropFlags;
 };
 
+// Bumped to 0x4859445C - invalidates any caches written by prior in-progress
+// experiments so loadScanCache always pattern-scans fresh on first launch.
 static const uint32_t CACHE_MAGIC = 0x4859445C;
 
 static std::string getCachePath() {
@@ -204,8 +227,10 @@ static std::string getCachePath() {
     return dir + "\\hydro_scan_cache.bin";
 }
 
-// Called when the StaticLoadObject sanity-test crashes. Lives outside initialize()
-// to avoid C2712 (std::filesystem destructors incompatible with __try).
+// Invoked when StaticLoadObject's sanity-test crash happens. Lives outside
+// initialize() so std::filesystem::path destructors don't conflict with the
+// __try block (C2712) inside initialize. Deletes the scan cache file so the
+// next launch re-discovers offsets fresh.
 static void staticLoadObjectCrashed(bool wasFromCache) {
     Hydro::logError("EngineAPI: StaticLoadObject CRASHED - %s",
         wasFromCache ? "stale cached pointer; will pattern-scan fresh next tick"
@@ -213,9 +238,14 @@ static void staticLoadObjectCrashed(bool wasFromCache) {
     s_staticLoadObject = nullptr;
     s_staticFindObject = nullptr;
     if (wasFromCache) {
-        // Stale ASLR base - every restored pointer is wrong. Zero all of them
-        // and clear s_poolReady so FNamePool re-scans next tick.
-        // s_layout.* fields (struct offsets) are kept - they don't shift with ASLR.
+        // Cache was loaded from a prior run with a different ASLR base.
+        // The crash means cached pointers are off by the ASLR delta - and
+        // SLO wasn't the only one cached. EVERY pointer restored from the
+        // scan cache (loadScanCache, ~line 277) carries the stale base.
+        // We must zero them all *and* clear the readiness flags that gate
+        // re-discovery, otherwise the next initialize() call sees
+        // s_poolReady=true and skips FNamePool re-scan, leaving every
+        // subsequent getObjectName / findObject reading garbage.
         s_fnamePool            = nullptr;
         s_guObjectArray        = nullptr;
         s_fnameConstructor     = nullptr;
@@ -223,8 +253,11 @@ static void staticLoadObjectCrashed(bool wasFromCache) {
         s_loadPackage          = nullptr;
         s_staticFindObjectFast = nullptr;
         s_openShaderLibrary    = nullptr;
-        s_poolReady            = false;
-        Hydro::logInfo("EngineAPI: cleared all cached pointers - full re-discovery next tick");
+        s_poolReady            = false;  // <- critical: gates discoverFNamePool
+        // s_layout.* is intentionally kept - those are struct offsets
+        // (e.g. 0x4C for FPROP_OFFSET_INTERNAL), not pointers. They don't
+        // shift with ASLR and stay valid across launches.
+        Hydro::logInfo("EngineAPI: cleared all cached pointers + s_poolReady - full re-discovery next tick");
     }
     std::error_code ec;
     std::filesystem::remove(getCachePath(), ec);
@@ -265,7 +298,8 @@ static bool loadScanCache(const GameModule& gm) {
             s_fnamePool, s_poolBlocksOffset);
     }
 
-    // Restore struct layout offsets (negative = not cached; re-runs lazily).
+    // Restore discovered struct layout (Layer 2 / chain-walk + FProperty).
+    // Treat any negative value as "not cached" - discovery re-runs lazily.
     if (cache.childPropsOffset >= 0 && cache.fieldNextOffset >= 0 && cache.fieldNameOffset >= 0 &&
         cache.fpropOffsetInternal >= 0 && cache.fpropElementSize >= 0 && cache.fpropFlags >= 0) {
         s_layout.childPropsOffset = cache.childPropsOffset;
@@ -298,6 +332,7 @@ static bool loadScanCache(const GameModule& gm) {
         }
     }
 
+    // Also set s_staticFindObject (alias used by discoverAssetRegistry fallback)
     s_staticFindObject = s_staticLoadObject;
 
     Hydro::logInfo("EngineAPI: Loaded scan cache - skipping pattern scan!");
@@ -423,10 +458,18 @@ static bool findGUObjectArray() {
 
     Hydro::logError("EngineAPI: GUObjectArray caller not found - trying data scan");
 
-    // Fallback: scan writable data sections at 8-byte stride for a plausible
-    // FChunkedFixedUObjectArray, accepting the candidate with the largest NumElements.
+    // Fallback: scan the module's data section directly for a plausible
+    // FChunkedFixedUObjectArray. Instead of searching code for LEA instructions
+    // (millions of matches, very slow), scan writable memory at pointer-aligned
+    // stride. The layout is:
+    //   +0x00: void** Objects (chunk table pointer - heap address)
+    //   +0x08: void*  PreAllocated (may be null)
+    //   +0x10: int32  MaxElements
+    //   +0x14: int32  NumElements
+    // We look for locations where NumElements is large (>50k) and MaxElements
+    // >= NumElements. The real GUObjectArray is the largest.
 
-    // Find data sections via PE header
+    // Find the data sections via PE header
     auto* dosHeader = (IMAGE_DOS_HEADER*)s_gm.base;
     auto* ntHeaders = (IMAGE_NT_HEADERS*)(s_gm.base + dosHeader->e_lfanew);
     auto* section = IMAGE_FIRST_SECTION(ntHeaders);
@@ -447,8 +490,13 @@ static bool findGUObjectArray() {
         return true;
     };
 
-    // Validate a candidate TUObjectArray: NumElements must be in range, chunk
-    // table must dereference, first 5 entries must contain heap UObjects.
+    // Probe one address as a candidate TUObjectArray (Objects @ +0x00,
+    // MaxElements @ +0x10, NumElements @ +0x14). Returns NumElements if
+    // the candidate validates (chunk table dereferences, first 5 entries
+    // contain heap-resident UObjects with heap-resident class pointers),
+    // else 0. The threshold is intentionally low (1000) so tiny test
+    // games like DummyModdableGame pass; small enough random ints in
+    // .data are filtered out by the structural validation that follows.
     auto probeShape = [&](uint8_t* addr) -> int32_t {
         int32_t numElems = *(int32_t*)(addr + FARRAY_NUM_ELEMS);
         if (numElems < 1000 || numElems > 2000000) return 0;
@@ -485,6 +533,10 @@ static bool findGUObjectArray() {
         size_t secSize = section->Misc.VirtualSize;
         if (secSize < 0x30) continue;
 
+        // Scan at 8-byte alignment (struct is pointer-aligned). Probe both
+        // global layouts at each address:
+        //   (a) addr is TUObjectArray-direct - UE 5.1 / Palworld
+        //   (b) addr is FUObjectArray, inner TUObjectArray @ +0x10 - UE 5.5
         for (size_t off = 0; off + 0x30 <= secSize; off += 8) {
             uint8_t* addr = secStart + off;
 
@@ -531,9 +583,11 @@ static bool findGUObjectArray() {
 
 // GUObjectArray iteration
 
+// Read a UObject* from GUObjectArray at the given index
 void* getObjectAt(int32_t index) {
     if (!s_guObjectArray || index < 0) return nullptr;
 
+    // Read chunk table pointer
     void** chunkTable = nullptr;
     if (!safeReadPtr((uint8_t*)s_guObjectArray + FARRAY_OBJECTS, (void**)&chunkTable) || !chunkTable)
         return nullptr;
@@ -541,10 +595,12 @@ void* getObjectAt(int32_t index) {
     int32_t chunkIndex = index / CHUNK_SIZE;
     int32_t withinChunk = index % CHUNK_SIZE;
 
+    // Read chunk pointer
     void* chunk = nullptr;
     if (!safeReadPtr(&chunkTable[chunkIndex], &chunk) || !chunk)
         return nullptr;
 
+    // Each FUObjectItem is FUOBJ_SIZE bytes. Object pointer is at offset 0.
     uint8_t* item = (uint8_t*)chunk + (withinChunk * FUOBJ_SIZE);
     void* obj = nullptr;
     if (!safeReadPtr(item + FUOBJ_OBJECT, &obj))
@@ -560,6 +616,7 @@ int32_t getObjectCount() {
     return count;
 }
 
+// Read the FName ComparisonIndex from a UObject (offset 0x18, first 4 bytes)
 uint32_t getNameIndex(void* obj) {
     if (!obj) return 0;
     uint32_t idx = 0;
@@ -572,7 +629,9 @@ uint32_t getNameIndex(void* obj) {
     return idx;
 }
 
-// Internal class read; public getClass() is at the bottom of the file.
+// Read ClassPrivate from a UObject (offset 0x10)
+// Note: public getClass() is defined at bottom of file. This is the early
+// static version used by internal discovery code before public API section.
 void* getObjClass(void* obj) {
     if (!obj) return nullptr;
     void* cls = nullptr;
@@ -580,12 +639,20 @@ void* getObjClass(void* obj) {
     return cls;
 }
 
+// Name resolution uses FName index comparisons instead of FName::ToString:
+// we construct an FName for the known target string and compare its
+// ComparisonIndex against candidates. This avoids needing the FName pool.
+
 // StaticLoadObject discovery
 
 using StaticLoadObjectFn_t = void*(__fastcall*)(
     void* Class, void* InOuter, const wchar_t* Name, const wchar_t* Filename,
     uint32_t LoadFlags, void* Sandbox, bool bAllowReconciliation, void* InstancingContext);
 
+// s_staticFindObject is forward-declared before the cache section
+// s_realStaticFindObject and s_loadPackage are forward-declared before the cache section
+
+// SEH-wrapped test call for candidate load functions
 static void* safeCallLoadObject(void* funcAddr, const wchar_t* path, uint32_t flags = 0) {
 #ifdef _WIN32
     __try {
@@ -598,6 +665,8 @@ static void* safeCallLoadObject(void* funcAddr, const wchar_t* path, uint32_t fl
 #endif
 }
 
+// SEH-wrapped 4-arg StaticFindObject: UObject*(UClass*, UObject*, const TCHAR*, bool).
+// Used to behaviorally validate candidate StaticFindObject functions.
 using StaticFindObjectFn_t = void*(__fastcall*)(void*, void*, const wchar_t*, bool);
 static void* safeCallFindObject(void* funcAddr, const wchar_t* path) {
 #ifdef _WIN32
@@ -611,8 +680,10 @@ static void* safeCallFindObject(void* funcAddr, const wchar_t* path) {
 #endif
 }
 
-// Object UClass pointer, cached after the first GUObjectArray walk.
-// Used to validate SFO/SLO candidates by pointer equality before FName resolver is up.
+// Anchor cache: the Object UClass pointer, resolved once via the GUObjectArray
+// walk. Used to behaviorally validate candidate StaticFindObject /
+// StaticLoadObject functions by pointer equality - bypasses getNameString
+// which depends on the FName resolver (not yet up during initial discovery).
 static void* getObjectClassAnchor() {
     static void* s_objectClass = nullptr;
     if (s_objectClass) return s_objectClass;
@@ -624,8 +695,14 @@ static void* getObjectClassAnchor() {
     return s_objectClass;
 }
 
-// Tier A: pointer-equality against the Object UClass anchor (preferred).
-// Tier B fallback: diversity check - two different paths must return different non-null pointers.
+// Behaviorally validate a candidate StaticFindObject. Two-tier check:
+//   Tier A (best): pointer-equality against the Object UClass anchor we
+//     found via GUObjectArray walk. Definitive when GUObjectArray + FName
+//     ctor are up.
+//   Tier B (fallback): diversity check. Call with two different paths;
+//     results must (a) both be non-null heap pointers and (b) differ.
+//     The buggy Palworld function returns the same /Script/AssetRegistry
+//     UPackage for every path, which fails this check.
 static bool validateStaticFindObjectCandidate(void* fn, std::string* outName) {
     if (outName) *outName = "<null>";
     if (!fn) return false;
@@ -654,6 +731,9 @@ static bool validateStaticFindObjectCandidate(void* fn, std::string* outName) {
     return ok;
 }
 
+// Behavioral validation for StaticLoadObject. Pointer-equality against the
+// same Object UClass anchor - load path returns the same already-resident
+// /Script/CoreUObject.Object UClass.
 static bool validateStaticLoadObjectResult(void* anyObj, std::string* outName) {
     if (outName) *outName = "<null>";
     if (!anyObj) return false;
@@ -670,8 +750,8 @@ static bool validateStaticLoadObjectCandidate(void* fn) {
 }
 
 static bool findStaticLoadObject() {
-    // "Failed to find object" is in StaticFindObject (find-only). Save it as
-    // a bonus; the actual loader is found via loading-specific strings below.
+    // "Failed to find object" is in StaticFindObject (find-only, no disk loading).
+    // Save it as a useful bonus, but we still need the actual loader.
     uint8_t* findStr = findWideString(s_gm.base, s_gm.size, L"Failed to find object");
     if (!findStr) {
         Hydro::logWarn("EngineAPI: 'Failed to find object' string not found");
@@ -680,6 +760,8 @@ static bool findStaticLoadObject() {
 
     Hydro::logInfo("EngineAPI: 'Failed to find object' at exe+0x%zX", (size_t)(findStr - s_gm.base));
 
+    // Find ALL LEA refs to this string - there may be multiple
+    // The one we want is inside StaticLoadObjectInternal
     for (size_t i = 0; i + 7 < s_gm.size; i++) {
         uint8_t* p = s_gm.base + i;
         if ((p[0] != 0x48 && p[0] != 0x4C) || p[1] != 0x8D) continue;
@@ -691,6 +773,10 @@ static bool findStaticLoadObject() {
 
         Hydro::logInfo("EngineAPI: LEA ref at exe+0x%zX", i);
 
+        // Walk back looking for a proper function prologue
+        // Common prologues: 48 89 5C (mov [rsp+x],rbx), 48 8B C4 (mov rax,rsp),
+        // 40 53 (push rbx), 48 89 4C (mov [rsp+x],rcx), 4C 89 44 (mov [rsp+x],r8)
+        // Also: sub rsp,XX after push instructions
         for (int back = 1; back < 4096; back++) {
             uint8_t* candidate = p - back;
             if (candidate < s_gm.base) break;
@@ -716,11 +802,16 @@ static bool findStaticLoadObject() {
         Hydro::logWarn("EngineAPI: Could not find prologue for LEA at exe+0x%zX", i);
     }
 
+    // What we found above is StaticFindObject (find-only, no loading).
+    // Save it - useful for finding in-memory objects.
     if (s_staticLoadObject) {
         s_staticFindObject = s_staticLoadObject;
         Hydro::logInfo("EngineAPI: StaticFindObject confirmed at %p", s_staticFindObject);
     }
 
+    // Now find the actual StaticLoadObject, which calls LoadPackage. That
+    // path references "Can't find file for package" or "CreateLinker".
+    // StaticLoadObject itself has "Attempting to load object" or is near "LoadObject".
     const wchar_t* loadStrings[] = {
         L"Attempting to find",
         L"LoadPackageInternal",
@@ -790,9 +881,18 @@ static bool findProcessEvent() {
     return false;
 }
 
+// Engine object discovery: load known classes/UFunctions directly via
+// StaticLoadObject, then locate instances by scanning GUObjectArray.
+
 static bool discoverEngineObjects() {
+    // Don't gate on s_staticLoadObject: on forked engines its pattern scan
+    // may produce a wrong function that we cleared. findObject() is now
+    // GUObjectArray-walk-based and resolves /Script/ classes reliably without
+    // depending on any pattern-scanned C++ load primitive.
     if (!s_guObjectArray && !s_staticLoadObject) return false;
 
+    // Resolve UWorld class via findObject (which is now resilient to broken
+    // StaticLoadObject); fall back to s_staticLoadObject if findObject misses.
     void* worldClass = findObject(L"/Script/Engine.World");
     if (!worldClass && s_staticLoadObject) {
         auto loadObj = (StaticLoadObjectFn_t)s_staticLoadObject;
@@ -818,7 +918,9 @@ static bool discoverEngineObjects() {
     }
 
     if (!s_world && worldClass) {
-        // Fallback: scan 'mov rax,[rip+disp]' for a global pointing at a UWorld instance.
+        // Fallback: scan 'mov rax,[rip+disp]' instructions, resolve the global
+        // they reference, and check whether it points at a UWorld instance.
+        // GWorld is read heavily in .text, so this converges quickly.
         Hydro::logInfo("EngineAPI: Scanning for GWorld via mov rax,[rip+xx]...");
 
         int checked = 0;
@@ -859,6 +961,9 @@ static bool discoverEngineObjects() {
         Hydro::logWarn("EngineAPI: UWorld not found");
     }
 
+    // Find GameplayStatics CDO + spawn UFunctions. Prefer findObject
+    // (GUObjectArray walk) - it's reliable on every UE5 host. Fall back
+    // to s_staticLoadObject if available for assets not yet in memory.
 #ifdef _WIN32
     __try {
         void* gsClass = findObject(L"/Script/Engine.GameplayStatics");
@@ -883,7 +988,9 @@ static bool discoverEngineObjects() {
                 }
             }
             if (!s_gameplayStaticsCDO) {
-                // CDO offset varies by build; scan UClass+0x100..+0x200.
+                // ClassDefaultObject lives somewhere inside UClass; its exact offset
+                // varies by build. Scan UClass+0x100..+0x200 for a pointer whose
+                // ClassPrivate is gsClass (a CDO is an instance of its own class).
                 Hydro::logInfo("EngineAPI: Scanning UClass for CDO pointer...");
                 for (int off = 0x100; off <= 0x200; off += 8) {
                     void* candidate = nullptr;
@@ -901,6 +1008,9 @@ static bool discoverEngineObjects() {
         }
     } __except(1) { Hydro::logWarn("EngineAPI: GameplayStatics discovery crashed"); }
 
+    // Load spawn UFunctions. Prefer findObject (always works once
+    // GameplayStatics class is loaded - its UFunctions are in GUObjectArray);
+    // fall back to s_staticLoadObject only if findObject misses.
     auto findFn = [](const wchar_t* path) -> void* {
         return findObject(path);
     };
@@ -943,15 +1053,18 @@ bool initialize() {
     }
     Hydro::logInfo("EngineAPI: Game module %zu MB at %p", s_gm.size / (1024*1024), s_gm.base);
 
+    // Try loading cached scan results first
     bool fromCache = loadScanCache(s_gm);
 
     if (!fromCache) {
+        // Step 1: Find StaticLoadObject (full pattern scan)
         if (!findStaticLoadObject()) {
             Hydro::logError("EngineAPI: StaticLoadObject not found");
             return false;
         }
 
-        // If the exe has a "StaticLoadObject" literal, prefer that over the heuristic result.
+        // If the exe has a "StaticLoadObject" literal, prefer that function
+        // over whatever findStaticLoadObject() picked above.
         uint8_t* loadObjStr = findWideString(s_gm.base, s_gm.size, L"StaticLoadObject");
         if (loadObjStr) {
             Hydro::logInfo("EngineAPI: Found 'StaticLoadObject' string at exe+0x%zX", (size_t)(loadObjStr - s_gm.base));
@@ -993,6 +1106,7 @@ bool initialize() {
         }
     } // end !fromCache
 
+    // Step 2: sanity-check the discovered StaticLoadObject with a known path
     Hydro::logInfo("EngineAPI: Testing StaticLoadObject call...");
     {
         auto fn = (StaticLoadObjectFn_t)s_staticLoadObject;
@@ -1008,6 +1122,9 @@ bool initialize() {
         }
 #endif
         if (anyObj) {
+            // Always try ProcessEvent extraction first - every UObject's
+            // vtable has ProcessEvent at the same slot, so the wrong
+            // function still gives us a usable PE pointer.
             void** vtable = nullptr;
             if (safeReadPtr(anyObj, (void**)&vtable) && vtable) {
                 void* pe = nullptr;
@@ -1017,12 +1134,18 @@ bool initialize() {
                     Hydro::logInfo("EngineAPI: ProcessEvent at %p", pe);
                 }
             }
+            // Behavioral validation lives in a separate function (C2712:
+            // can't combine __try with C++ unwinding objects in one func).
             bool isObject = validateStaticLoadObjectResult(anyObj, nullptr);
             if (isObject) {
                 Hydro::logInfo("EngineAPI: StaticLoadObject validated (returned 'Object')");
             } else {
-                Hydro::logWarn("EngineAPI: StaticLoadObject FAILED validation - clearing");
+                Hydro::logWarn("EngineAPI: StaticLoadObject FAILED validation - clearing s_staticLoadObject and s_staticFindObject (both aliased to the same broken pointer).");
                 s_staticLoadObject = nullptr;
+                // s_staticFindObject is aliased to the same broken function
+                // during discovery; without clearing it, loadObject's tier-3
+                // fallback would call the wrong function and return garbage
+                // pointers that look "valid" but aren't real UClasses.
                 s_staticFindObject = nullptr;
             }
         } else {
@@ -1035,17 +1158,21 @@ bool initialize() {
     }
 
     if (!fromCache) {
+    // Step 3: Find GUObjectArray (needed for finding UWorld instance)
     if (!findGUObjectArray()) {
         Hydro::logWarn("EngineAPI: GUObjectArray not found - will try alternate world discovery");
     }
 
+    // Step 4: Find LoadPackage via "Attempted to LoadPackage" string
     {
         uint8_t* lpStr = findWideString(s_gm.base, s_gm.size,
             L"Attempted to LoadPackage from empty PackagePath");
         if (lpStr) {
             Hydro::logInfo("EngineAPI: 'Attempted to LoadPackage' at exe+0x%zX", (size_t)(lpStr - s_gm.base));
+            // This string is in LoadPackageInternal. Find the LEA, walk to function start.
             uint8_t* leaAddr = findLeaRef(s_gm.base, s_gm.size, lpStr);
             if (leaAddr) {
+                // Walk back to prologue
                 for (int back = 1; back < 8192; back++) {
                     uint8_t* c = leaAddr - back;
                     if (c < s_gm.base) break;
@@ -1069,14 +1196,26 @@ bool initialize() {
             Hydro::logWarn("EngineAPI: LoadPackage not found");
     }
 
-    // Find the real StaticFindObject via callers of StaticFindObjectFast.
-    // Skipped by default (HYDRO_SKIP_REAL_SFO=0 to force): probing 32 candidates
-    // can hang on some UE 5.5 hosts. The /Script/-only SFO from Step 4 suffices
-    // for reflection; the wider variant is only needed for cooked-asset path resolution.
+    // Step 5: Find the real StaticFindObject. The function reached from
+    // "Failed to find object" only resolves /Script/ paths; the full-path
+    // variant calls StaticFindObjectFast (which uniquely contains the
+    // "Illegal call to StaticFindObjectFast" string), so we locate that and
+    // pick its largest caller as StaticFindObject.
+    // Skip when env HYDRO_SKIP_REAL_SFO=1: the validation loop probe-calls up
+    // to 32 candidate functions with a wide-string arg. On UE 5.5 / DMG, one
+    // candidate hangs the init thread (probe is structurally unsafe - we are
+    // calling unknown functions with hopeful signatures). The /Script/-only
+    // StaticFindObject from Step 4 is enough for reflection dumping; the
+    // wider variant is only needed for cooked-asset path resolution. Set
+    // HYDRO_SKIP_REAL_SFO=0 to force step 5 on UE 5.1 / Palworld where the
+    // probe doesn't hang.
     bool skipRealSFO = false;
     if (char* envSkip = std::getenv("HYDRO_SKIP_REAL_SFO")) {
         skipRealSFO = (envSkip[0] == '1');
     } else {
+        // Default: skip on UE 5.5+ (heuristic via game module size - DMG is
+        // ~143 MB, Palworld ~600 MB; safer is to bias-skip and let UE 5.1
+        // hosts opt back in via env).
         skipRealSFO = true;
     }
     if (skipRealSFO) {
@@ -1111,8 +1250,13 @@ bool initialize() {
                     Hydro::logInfo("EngineAPI: StaticFindObjectFast at exe+0x%zX",
                         (size_t)(findObjFast - s_gm.base));
 
-                    // Collect size-range candidates; validate by behavior below.
-                    // Size-only is unreliable on forked engines.
+                    // Collect every distinct moderate-sized caller of
+                    // StaticFindObjectFast as a candidate. Picking by size
+                    // alone is unreliable on forked engines (Palworld's
+                    // 217 callers contain multiple ~800-byte functions; the
+                    // largest happens to be a wrong one that always returns
+                    // /Script/AssetRegistry). Instead we collect all viable
+                    // candidates and validate each by behavior below.
                     int callerCount = 0;
                     struct Candidate { uint8_t* addr; size_t size; };
                     constexpr int MAX_CANDIDATES = 32;
@@ -1154,6 +1298,8 @@ bool initialize() {
                         for (size_t off = 0; off < 8192; off++) {
                             if (funcStart[off] == 0xCC && funcStart[off+1] == 0xCC) { funcSize = off; break; }
                         }
+                        // StaticFindObject is roughly 100-2000 bytes - widen
+                        // the band so we don't miss the real one on forked builds.
                         if (funcSize <= 100 || funcSize >= 2000) continue;
 
                         if (numCandidates < MAX_CANDIDATES)
@@ -1163,7 +1309,9 @@ bool initialize() {
                     Hydro::logInfo("EngineAPI: %d callers of StaticFindObjectFast -> %d unique size-range candidates",
                         callerCount, numCandidates);
 
-                    // Sort descending by size; real SFO is usually larger.
+                    // Sort candidates by size descending - try the largest first
+                    // since real StaticFindObject is usually toward the upper end
+                    // of the band (it does ResolveName + several lookups).
                     for (int a = 0; a < numCandidates; a++) {
                         for (int b = a + 1; b < numCandidates; b++) {
                             if (candidates[b].size > candidates[a].size) {
@@ -1174,6 +1322,11 @@ bool initialize() {
                         }
                     }
 
+                    // Behavioral validation: call each candidate with
+                    // L"/Script/CoreUObject.Object" - only the real
+                    // StaticFindObject returns a UObject named "Object".
+                    // Validation lives in a helper function so MSVC's C2712
+                    // (no __try in functions with C++ unwinding) is avoided.
                     for (int k = 0; k < numCandidates; k++) {
                         uint8_t* fn = candidates[k].addr;
                         // Capture both probe results for diagnostics
@@ -1196,6 +1349,9 @@ bool initialize() {
         if (!s_realStaticFindObject)
             Hydro::logWarn("EngineAPI: Real StaticFindObject not found");
 
+        // SLO scan moved out of !fromCache so it also runs after a cache load
+        // when validation cleared s_staticLoadObject. See the block past
+        // `} // end !fromCache (pattern scans)`.
         if (false) {
             uint8_t* sfo = (uint8_t*)s_realStaticFindObject;
             int callerCount = 0;
@@ -1246,6 +1402,8 @@ bool initialize() {
             Hydro::logInfo("EngineAPI: SLO scan: %d callers of StaticFindObject -> %d candidates",
                            callerCount, numCands);
 
+            // Sort by size descending - real SLO is usually larger than its
+            // siblings (it does load-flags handling + LoadPackage + cache work).
             for (int a = 0; a < numCands; a++) {
                 for (int b = a + 1; b < numCands; b++) {
                     if (candidates[b].size > candidates[a].size) {
@@ -1273,15 +1431,20 @@ bool initialize() {
         }
     }
 
+    // Step 6: Find FName constructor (needed for AssetRegistry calls)
     if (!findFNameConstructor()) {
         Hydro::logWarn("EngineAPI: FName constructor not found - asset loading disabled");
     }
 
+    // Save scan cache for next launch
     saveScanCache(s_gm);
-    } // end !fromCache
+    } // end !fromCache (pattern scans)
 
-    // Recover SLO by validating callers of the validated SFO.
-    // Runs in both cache-load and fresh-scan paths.
+    // -- Recover real StaticLoadObject by validating callers of the
+    //    now-validated StaticFindObject. Runs in BOTH cache-load and
+    //    full-scan paths - when cache loads a stale s_staticLoadObject
+    //    that fails behavioral validation, this rescans without needing
+    //    to nuke the entire cache.
     if (s_realStaticFindObject && !s_staticLoadObject) {
         uint8_t* sfo = (uint8_t*)s_realStaticFindObject;
         int callerCount = 0;
@@ -1353,6 +1516,9 @@ bool initialize() {
         }
     }
 
+    // Runtime discovery (always runs - heap objects change each launch)
+
+    // GUObjectArray: retry if not found (may have been cached as null)
     if (!s_guObjectArray) {
         if (findGUObjectArray()) {
             // Update cache with the newly found address
@@ -1362,16 +1528,29 @@ bool initialize() {
         }
     }
 
-    // Probe struct offsets before any property-chain walks so cached UFunction
-    // layouts don't embed stale fallback values.
+    // Layer 2 - probe FProperty/FField/UStruct internal offsets BEFORE any
+    // discovery code that walks property chains (AssetRegistry, engine
+    // objects). Otherwise those discovery paths read with stock-UE-5.5
+    // fallback offsets and cache garbage UFunction layouts that won't be
+    // refreshed later. Layer 2 only needs s_guObjectArray + s_fnameConstructor,
+    // which are up by this point.
     if (s_guObjectArray && s_fnameConstructor && !s_layout.succeeded) {
         if (discoverPropertyLayout()) {
+            // Discard any UFunction layouts cached by earlier (broken) walks
+            // so subsequent getUFunctionParmsSize/RetOffset re-derive with
+            // the real Layer-2 offsets.
             clearUFuncLayoutCache();
             saveScanCache(s_gm);
         }
     }
 
-    // FName resolution must come before AR/engine-object discovery.
+    // FName resolution MUST come before AssetRegistry/engine-object discovery.
+    // Both discovery paths call findObject -> getObjectName -> FNamePool reads;
+    // if FNamePool isn't discovered yet, getObjectName returns "<FName:N>"
+    // placeholders and string-based scans miss everything. Previous order
+    // bug: FNamePool was at the end of init, so a fresh init after SLO-crash-
+    // clear ran AR/engine-object discovery against null FNamePool and silently
+    // found nothing, leaving s_assetRegHelpersCDO/s_world etc. permanently null.
     if (!s_poolReady) {
         if (discoverFNamePool()) {
             saveScanCache(s_gm);
@@ -1383,16 +1562,22 @@ bool initialize() {
         }
     }
 
+    // Discover AssetRegistry objects (now safe - FNamePool reads work)
     if (s_fnameConstructor) {
         if (!discoverAssetRegistry()) {
             Hydro::logWarn("EngineAPI: AssetRegistry not fully initialized");
         }
     }
 
+    // Discover engine objects (UWorld, GameplayStatics, spawn functions)
     if (!discoverEngineObjects()) {
         Hydro::logWarn("EngineAPI: Some engine objects not found - spawning may fail");
     }
 
+    // FShaderCodeLibrary::OpenLibrary - needed for runtime-mounted mod paks
+    // to actually render their materials. Without it, paks mount but their
+    // shader archives stay invisible to the renderer -> materials fall back
+    // to defaults.
     if (!s_openShaderLibrary) {
         if (findOpenShaderLibrary()) {
             saveScanCache(s_gm);
@@ -1401,6 +1586,10 @@ bool initialize() {
         }
     }
 
+    // Layer 2: probe FProperty internal offsets against AActor anchors.
+    // Only meaningful once findObject + FName ctor are up. Lazy-init also
+    // covers later first-use paths, but triggering here lets us persist
+    // the discovered layout into the scan cache.
     if (s_realStaticFindObject && s_fnameConstructor && !s_layout.succeeded) {
         if (discoverPropertyLayout()) saveScanCache(s_gm);
     }
@@ -1408,13 +1597,97 @@ bool initialize() {
     s_ready = (s_processEvent != nullptr);
     Hydro::logInfo("EngineAPI: Bootstrap %s", s_ready ? "COMPLETE" : "PARTIAL");
 
+    // Helper: Descriptor literals here would trip MSVC C2712 (this fn has __try).
+    if (s_ready) seedAndResolveRawFunctions();
+
+    // -- FNamePool sanity diagnostic --
+    // Hypothesis (confirmed by parallel research 2026-04-28): on forked
+    // engines like Palworld, Strategy-2 data-section scan can latch onto a
+    // structurally-valid-but-functionally-wrong FNamePool - a debug stub or
+    // freshly-initialized object whose Block[0][0] happens to look like a
+    // "None" entry but whose Blocks[1..N] are null/garbage. Symptom: low
+    // FName indices (in Block[0]) decode correctly; higher indices return
+    // empty strings, so most findObject lookups silently miss.
+    // This dump captures the evidence to prove or refute the hypothesis.
+    // Fires once at bootstrap; cheap; reads only the pool struct header
+    // and a few sentinel block pointers.
+    if (s_ready && s_fnamePool && s_poolBlocksOffset >= 0) {
+        Hydro::logInfo("EngineAPI: FNamePool sanity diagnostic --");
+        Hydro::logInfo("  s_fnamePool=%p  s_poolBlocksOffset=0x%X",
+            s_fnamePool, s_poolBlocksOffset);
+        // FNameEntryAllocator layout: FRWLock(8) + uint32 CurrentBlock(4)
+        // + uint32 CurrentByteCursor(4) = 0x10, then Blocks[].
+        uint32_t currentBlock = 0;
+        uint32_t cursor = 0;
+        safeReadInt32((uint8_t*)s_fnamePool + 8, (int32_t*)&currentBlock);
+        safeReadInt32((uint8_t*)s_fnamePool + 12, (int32_t*)&cursor);
+        Hydro::logInfo("  CurrentBlock=%u  CurrentByteCursor=%u  (real engine pool: dozens; stub: 0-1)",
+            currentBlock, cursor);
+
+        // Walk Blocks[0..min(currentBlock+1, 16)] and dump pointer + first
+        // 8 bytes of each. Real pool: each block is a heap pointer (~64KB
+        // away from prior). Stub: only Blocks[0] is set, rest null.
+        int blocksToDump = (int)currentBlock + 1;
+        if (blocksToDump > 16) blocksToDump = 16;
+        if (blocksToDump < 4)  blocksToDump = 4;  // always probe at least 4 to expose stubs
+        for (int b = 0; b < blocksToDump; b++) {
+            void* blockPtr = nullptr;
+            bool readOk = safeReadPtr(
+                (uint8_t*)s_fnamePool + s_poolBlocksOffset + b * 8,
+                &blockPtr);
+            if (!readOk) {
+                Hydro::logInfo("  Blocks[%d]: read FAILED", b);
+                continue;
+            }
+            if (!blockPtr) {
+                Hydro::logInfo("  Blocks[%d]: NULL", b);
+                continue;
+            }
+            uint8_t firstBytes[8] = {};
+            for (int k = 0; k < 8; k++) {
+                int32_t v = 0;
+                if (safeReadInt32((uint8_t*)blockPtr + k, &v))
+                    firstBytes[k] = (uint8_t)v;
+            }
+            Hydro::logInfo("  Blocks[%d]=%p  first8: %02X %02X %02X %02X %02X %02X %02X %02X",
+                b, blockPtr,
+                firstBytes[0], firstBytes[1], firstBytes[2], firstBytes[3],
+                firstBytes[4], firstBytes[5], firstBytes[6], firstBytes[7]);
+        }
+
+        // Probe a few specific FName indices via the real reader.
+        // Index 0 = always "None". Index 0x10000 = first entry in Block[1].
+        auto probeIdx = [](uint32_t idx, const char* label) {
+            char buf[256] = {};
+            bool wide = false;
+            int len = readPoolEntryRaw(idx, buf, sizeof(buf) - 1, &wide);
+            if (len > 0) {
+                buf[len < (int)sizeof(buf) - 1 ? len : (int)sizeof(buf) - 1] = 0;
+                Hydro::logInfo("  readFromPool(idx=0x%X, %s): len=%d wide=%d str='%s'",
+                    idx, label, len, wide ? 1 : 0, buf);
+            } else {
+                Hydro::logInfo("  readFromPool(idx=0x%X, %s): FAILED (len=0)",
+                    idx, label);
+            }
+        };
+        probeIdx(0,        "Block[0] entry 0 - must be 'None'");
+        probeIdx(2,        "Block[0] entry 1 - small early FName");
+        probeIdx(0x10000,  "Block[1] entry 0 - DECOY TEST: garbage means stub pool");
+        probeIdx(0x20000,  "Block[2] entry 0 - sanity, should be valid on real pool");
+        Hydro::logInfo("EngineAPI: FNamePool sanity diagnostic done --");
+    }
+
     return s_ready;
 }
 
 bool isReady() { return s_ready; }
 
-// FName constructor: void __fastcall FName::FName(FName*, const TCHAR*, int32 FindType)
-// FindType: 0 = FNAME_Find, 1 = FNAME_Add
+// Public API: loadObject
+
+// FName constructor discovery
+
+// FName constructor: void __fastcall FName::FName(FName* this, const TCHAR* Name, int32 FindType)
+// Where FindType: 0 = FNAME_Find, 1 = FNAME_Add
 using FNameCtorFn = void(__fastcall*)(void* outFName, const wchar_t* name, int32_t findType);
 
 struct FName8 { uint32_t comparisonIndex; uint32_t number; };
@@ -1461,6 +1734,8 @@ static uint8_t* resolveRip4(uint8_t* addr) {
 }
 
 static bool findFNameConstructor() {
+    // Instruction-pattern search modeled on patternsleuth's fname.rs.
+    // Tier 1: direct byte pattern whose trailing E8 targets the constructor.
     Hydro::logInfo("EngineAPI: Searching for FName constructor (Tier 1: direct pattern)...");
     {
         const char* pat = "EB 07 48 8D 15 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 41 B8 01 00 00 00 E8";
@@ -1482,6 +1757,8 @@ static bool findFNameConstructor() {
         }
     }
 
+    // Tier 2: String xref patterns (from patternsleuth fname.rs lines 147-163)
+    // Find known strings, then match instruction patterns around the LEA
     Hydro::logInfo("EngineAPI: Searching for FName constructor (Tier 2: string xref)...");
     const wchar_t* anchorStrings[] = {
         L"MovementComponent0",
@@ -1501,9 +1778,10 @@ static bool findFNameConstructor() {
             int32_t disp = *(int32_t*)(p + 3);
             if (p + 7 + disp != strAddr) continue;
 
-            // Found LEA rdx to our string. Check instruction patterns after it.
+            // Found LEA rdx to our string at exe+i. Check instruction patterns after it:
 
-            // Pattern A: lea rdx,[str]; lea rcx,[fname]; call ctor
+            // Pattern A: 48 8D 15 [str] 48 8D 0D ?? ?? ?? ?? E8 [FName ctor]
+            // (lea rdx,[str]; lea rcx,[fname]; call ctor)
             if (p[7] == 0x48 && p[8] == 0x8D && p[9] == 0x0D) {
                 if (p[14] == 0xE8) {
                     uint8_t* target = resolveRip4(p + 15);
@@ -1520,7 +1798,8 @@ static bool findFNameConstructor() {
                 }
             }
 
-            // Pattern B: lea rdx,[str]; lea r8,[?]; mov r9b,1; call wrapper->ctor
+            // Pattern B: 48 8D 15 [str] 4C 8D 05 ?? ?? ?? ?? 41 B1 01 E8 [wrapper->ctor]
+            // (lea rdx,[str]; lea r8,[?]; mov r9b,1; call wrapper)
             if (p[7] == 0x4C && p[8] == 0x8D && p[9] == 0x05) {
                 if (p[14] == 0x41 && p[15] == 0xB1 && p[16] == 0x01 && p[17] == 0xE8) {
                     uint8_t* target = resolveRip4(p + 18);
@@ -1530,7 +1809,7 @@ static bool findFNameConstructor() {
                             if (target[off] == 0xE8) {
                                 uint8_t* innerTarget = resolveRip4(target + off + 1);
                                 if (innerTarget >= s_gm.base && innerTarget < s_gm.base + s_gm.size) {
-                                    FName8 validate = {};
+                                    FName8 validate = {0xFFFF, 0xFFFF};
                                     if (safeConstructFName(&validate, L"None", innerTarget) &&
                                         validate.comparisonIndex == 0 && validate.number == 0) {
                                         s_fnameConstructor = innerTarget;
@@ -1545,13 +1824,15 @@ static bool findFNameConstructor() {
                 }
             }
 
-            // Pattern C: mov r8d,1; lea rdx,[str]; lea rcx,[fname]; jmp ctor
+            // Pattern C: 41 B8 01 00 00 00 48 8D 15 [str] 48 8D 0D ?? ?? ?? ?? E9 [jmp to ctor]
+            // Check bytes before the LEA
             if (i >= 6 && p[-6] == 0x41 && p[-5] == 0xB8 && p[-4] == 0x01 &&
                 p[-3] == 0x00 && p[-2] == 0x00 && p[-1] == 0x00) {
                 if (p[7] == 0x48 && p[8] == 0x8D && p[9] == 0x0D && p[14] == 0xE9) {
                     uint8_t* target = resolveRip4(p + 15);
                     if (target >= s_gm.base && target < s_gm.base + s_gm.size) {
-                        FName8 validate = {};
+                        // Validate: construct FName("None") - must be index 0
+                        FName8 validate = {0xFFFF, 0xFFFF};
                         if (safeConstructFName(&validate, L"None", target) &&
                             validate.comparisonIndex == 0 && validate.number == 0) {
                             s_fnameConstructor = target;
@@ -1569,7 +1850,11 @@ static bool findFNameConstructor() {
     return false;
 }
 
-// Walks UClass::Children (UField linked list) up the SuperStruct chain.
+// UClass function chain walker
+// Walks UClass::Children (UField linked list) to find a UFunction by name.
+// This is how UE4SS resolves functions (GetFunctionByNameInChain).
+// Returns the UFunction with the correct native Func pointer.
+
 static void* findFunctionOnClass(void* uclass, const wchar_t* funcName) {
     if (!uclass || !funcName || !s_fnameConstructor) return nullptr;
 
@@ -1577,6 +1862,10 @@ static void* findFunctionOnClass(void* uclass, const wchar_t* funcName) {
     FName8 targetName = {};
     if (!safeConstructFName(&targetName, funcName)) return nullptr;
 
+    // Walk UClass::Children (UField* linked list at offset 0x48), then up
+    // the SuperStruct chain. Inherited functions live on ancestor UClasses -
+    // e.g. ACharacter inherits K2_GetActorLocation from AActor, so looking
+    // only at ACharacter's Children finds nothing.
     void* current = uclass;
     int classDepth = 0;
     while (current && classDepth < 32) {
@@ -1598,6 +1887,7 @@ static void* findFunctionOnClass(void* uclass, const wchar_t* funcName) {
             count++;
         }
 
+        // Climb to the super class via UStruct::SuperStruct.
         void* super = nullptr;
         safeReadPtr((uint8_t*)current + (s_superOffset < 0 ? 0x40 : s_superOffset), &super);
         if (super == current) break;  // defensive: no self-loop
@@ -1617,7 +1907,11 @@ static bool discoverAssetRegistry() {
     using FindObjFn = void*(__fastcall*)(void*, void*, const wchar_t*, bool);
 
     auto find = [](const wchar_t* path) -> void* {
+        // Primary: GUObjectArray-walk findObject. Validated against forked
+        // engines, doesn't depend on pattern-scanned C++ load primitives.
         if (void* r = findObject(path)) return r;
+        // Fallback 1: discovered StaticFindObject (only if non-null - it gets
+        // cleared on hosts where behavioral validation rejects it).
         if (s_realStaticFindObject) {
             auto fn = (FindObjFn)s_realStaticFindObject;
             void* result = nullptr;
@@ -1629,6 +1923,7 @@ static bool discoverAssetRegistry() {
 #endif
             if (result) return result;
         }
+        // Fallback 2: legacy alias (also nulled on hosts that fail validation).
         if (s_staticFindObject)
             return safeCallLoadObject(s_staticFindObject, path, 0);
         return nullptr;
@@ -1639,6 +1934,9 @@ static bool discoverAssetRegistry() {
     if (s_assetRegHelpersCDO)
         Hydro::logInfo("EngineAPI: AssetRegistryHelpers CDO at %p", s_assetRegHelpersCDO);
 
+    // Find GetAsset UFunction via the UClass function chain (same as
+    // UE4SS's GetFunctionByNameInChain). This gives us the UFunction
+    // with the intact native Func pointer.
     if (s_assetRegHelpersCDO) {
         void* cdoClass = nullptr;
         safeReadPtr((uint8_t*)s_assetRegHelpersCDO + UOBJ_CLASS, &cdoClass);
@@ -1665,6 +1963,7 @@ static bool discoverAssetRegistry() {
             Hydro::logInfo("EngineAPI: GetAsset UFunction at %p (fallback StaticFindObject)", s_getAssetFunc);
     }
 
+    // Find AssetRegistry implementation
     s_assetRegImpl = find(L"/Script/AssetRegistry.Default__AssetRegistryImpl");
     if (!s_assetRegImpl)
         s_assetRegImpl = find(L"/Script/AssetRegistry.Default__AssetRegistry");
@@ -1687,10 +1986,12 @@ static bool discoverAssetRegistry() {
         }
     }
 
+    // Find GetAssetRegistry UFunction - needed to get the RUNTIME registry instance
     auto* getRegistryFunc = find(L"/Script/AssetRegistry.AssetRegistryHelpers:GetAssetRegistry");
     if (getRegistryFunc && s_assetRegHelpersCDO && s_processEvent) {
         Hydro::logInfo("EngineAPI: GetAssetRegistry UFunction at %p - calling to get runtime instance...", getRegistryFunc);
 
+        // GetAssetRegistry returns FScriptInterface (UObject* + void* = 16 bytes)
         uint8_t regParams[32] = {};
         if (callProcessEvent(s_assetRegHelpersCDO, getRegistryFunc, regParams)) {
             void* runtimeRegistry = *(void**)(regParams + 0x00); // UObject* from FScriptInterface
@@ -1704,11 +2005,28 @@ static bool discoverAssetRegistry() {
     return s_assetRegHelpersCDO && s_getAssetFunc;
 }
 
-// GUObjectArray-walk findObject: splits path on '.' and ':' into ordered parts
-// (e.g. "/Script/Engine.Actor" -> ["/Script/Engine", "Actor"]), then walks the
-// array matching FName indices against each part and checking the outer chain.
+// Public API: findObject (in-memory only)
 
+// StaticFindObject signature: UObject*(UClass*, UObject*, const TCHAR*, bool)
+// Only 4 params - different from StaticLoadObject's 8
 using StaticFindObjectFn = void*(__fastcall*)(void*, void*, const wchar_t*, bool);
+
+// -- GUObjectArray-walk findObject ---
+// Pattern-scanned StaticFindObject is fragile across UE forks: on Palworld
+// our discovered function returns the wrong object for every path. The
+// robust primitive is to walk GUObjectArray ourselves, matching by FName +
+// outer chain. UE4SS uses the same approach for early-init lookups before
+// offsets are validated (see deps/RE-UE4SS UObjectGlobals.cpp:135 -
+// StaticFindObject_InternalNoToStringFromNames).
+// Path syntax: split on '.' and ':' into ordered name parts, e.g.
+//   /Script/Engine.Actor              -> ["/Script/Engine", "Actor"]
+//   /Script/Pkg.Class:Member          -> ["/Script/Pkg", "Class", "Member"]
+//   /Game/Mods/M/Sphere.Sphere_C      -> ["/Game/Mods/M/Sphere", "Sphere_C"]
+// UPackages store their full slash-path as a single FName, which is why
+// the leading slash stays bound to the first component.
+// For each candidate object whose own FName matches the last part, walk
+// its outer chain comparing each step's FName against the parts in
+// reverse. Match = exact length and exact ordered name match.
 
 static std::unordered_map<std::wstring, void*> s_findObjectCache;
 
@@ -1727,6 +2045,8 @@ static void* findObjectViaScan(const wchar_t* path) {
     }
     if (parts.empty()) return nullptr;
 
+    // Resolve each part to its FName ComparisonIndex (FNAME_Add - safe;
+    // the engine canonicalizes case-insensitively).
     std::vector<uint32_t> partIdx;
     partIdx.reserve(parts.size());
     for (auto& s : parts) {
@@ -1736,13 +2056,16 @@ static void* findObjectViaScan(const wchar_t* path) {
     }
     uint32_t targetNameIdx = partIdx.back();
 
+    // Read GUObjectArray header.
     void** chunkTable = nullptr;
     int32_t count = 0;
     if (!safeReadPtr((uint8_t*)s_guObjectArray + FARRAY_OBJECTS, (void**)&chunkTable)) return nullptr;
     if (!safeReadInt32((uint8_t*)s_guObjectArray + FARRAY_NUM_ELEMS, &count)) return nullptr;
     if (!chunkTable || count <= 0) return nullptr;
 
-    // Strict pass: full outer chain must match parts in exact order.
+    // First pass - strict match: obj.name == lastPart, full outer chain
+    // matches the parts list in exact order with no intermediates allowed.
+    // Catches typical /Script/ class lookups quickly.
     void* strictMatch = nullptr;
     void* fallbackMatch = nullptr;
 
@@ -1757,10 +2080,13 @@ static void* findObjectViaScan(const wchar_t* path) {
         void* obj = nullptr;
         if (!safeReadPtr(item + FUOBJ_OBJECT, &obj) || !obj) continue;
 
+        // Early reject: own name FName must match the last path part.
         uint32_t selfIdx = 0;
         if (!safeReadInt32((uint8_t*)obj + UOBJ_NAME, (int32_t*)&selfIdx)) continue;
         if (selfIdx != targetNameIdx) continue;
 
+        // Walk outer chain. Try strict first: every part must line up in
+        // exact order with no leftover/missing levels.
         void* cur = obj;
         bool strict = true;
         for (int k = (int)partIdx.size() - 1; k >= 0; k--) {
@@ -1778,8 +2104,19 @@ static void* findObjectViaScan(const wchar_t* path) {
             break;  // strict win - done
         }
 
-        // Fallback: obj.name matches last part AND outermost package matches first part
-        // (case-insensitive string compare; FName index parity isn't guaranteed on forks).
+        // Forgiving fallback (UE's StaticFindObject convention): obj.name
+        // matches the last part AND obj's OUTERMOST package matches the
+        // first part. Ignores intermediate UClass outers - handles CDO
+        // queries like `/Script/AssetRegistry.Default__AssetRegistryHelpers`
+        // where the actual outer chain is `Pkg -> UClass -> CDO` but UE
+        // accepts the abbreviated `Pkg.CDO` query form.
+        // Forgiving "Pkg.Leaf" form: walk to outermost, compare the package
+        // name as a *string* (case-insensitive). FName ComparisonIndex parity
+        // for package names isn't guaranteed across forked engines - we've
+        // observed the same string yielding different indices via FNAME_Add
+        // vs the actual stored index on the live UPackage. Decoded-string
+        // compare is the resilient check at this level. Inner levels (which
+        // tier-1 already covered) stay on the faster index path.
         if (!fallbackMatch && partIdx.size() >= 2) {
             void* outerCur = obj;
             void* outermost = obj;
@@ -1813,8 +2150,16 @@ static void* findObjectViaScan(const wchar_t* path) {
     if (strictMatch) return strictMatch;
     if (fallbackMatch) return fallbackMatch;
 
-    // Tier-3 diagnostic: on tiers 1+2 miss, dump candidates matching by string
-    // to surface FName index mismatches. One-shot per unique path.
+    // -- Tier-3 diagnostics - fired only when tiers 1+2 missed.
+    // Goal: capture *why* the FName-index path missed so we can fix the
+    // actual root cause, not just lean on the string-compare fallback.
+    // Strategy: for the LEAF FName (the rightmost path part), find every
+    // candidate object whose *string* name matches (case-insensitive),
+    // dump its outer chain with both FName-indices and resolved strings,
+    // and explicitly highlight any mismatch between our computed
+    // partIdx[k] and the candidate's actual stored FName index at chain
+    // position k.
+    // One-shot per unique path to avoid log spam.
     static std::unordered_map<std::wstring, bool> s_diagDumped;
     if (s_diagDumped.find(p) == s_diagDumped.end()) {
         s_diagDumped[p] = true;
@@ -1883,8 +2228,12 @@ static void* findObjectViaScan(const wchar_t* path) {
             }
         }
         if (diagFound == 0) {
-            // No string-name match at all: dump first 10 entries to check if
-            // the GUObjectArray walk itself is broken.
+            // Ground-truth dump: iterate the first 10 GUObjectArray entries
+            // and print everything we read. If these come back as garbage
+            // (wild pointers, empty names, classes with no name) it means
+            // our GUObjectArray walk or FNamePool reads are broken -
+            // fundamentally different bug than "object not loaded".
+            // Fires once globally to avoid log spam.
             static bool s_groundTruthDumped = false;
             if (!s_groundTruthDumped) {
                 s_groundTruthDumped = true;
@@ -1924,8 +2273,12 @@ static void* findObjectViaScan(const wchar_t* path) {
         }
     }
 
-    // Tier 3: full-path string compare (catch-all for forks where CDO outer-chain
-    // shape differs from stock UE, e.g. Palworld's UE 5.1.x AssetRegistry CDOs).
+    // Tier 3 - UE4SS-style full-path string compare.
+    // Mirrors StaticFindObject_InternalSlow (UObjectGlobals.cpp:111): walk
+    // every UObject whose self-name matches the leaf, build its full outer-
+    // chain path string, case-insensitive compare against the input. This is
+    // the resilient catch-all for forks where the CDO's outer chain shape
+    // differs from stock UE (e.g. Palworld's UE 5.1.x AssetRegistry CDOs).
     auto iequalNarrow = [](const std::string& a, const std::string& b) {
         if (a.size() != b.size()) return false;
         for (size_t i = 0; i < a.size(); i++) {
@@ -1946,6 +2299,10 @@ static void* findObjectViaScan(const wchar_t* path) {
     std::string targetNarrow = wideToNarrow(p);
     std::string leafNarrow   = wideToNarrow(parts.back());
 
+    // Prefilter on leaf NAME STRING (not FName index) to dodge potential
+    // FName interning quirks on forked engines where FNAME_Add for our query
+    // string may not return the same ComparisonIndex as the actual stored
+    // object's name. Slower than index compare but handles every fork.
     for (int32_t i = 0; i < count; i++) {
         int chunkIdx    = i / CHUNK_SIZE;
         int withinChunk = i % CHUNK_SIZE;
@@ -1970,6 +2327,9 @@ static void* findObjectViaScan(const wchar_t* path) {
 void* findObject(const wchar_t* path) {
     if (!path) return nullptr;
 
+    // Cache check. Validate cached entry with one read so a GC'd object
+    // doesn't stick around (rare for /Script/ classes which are root-held,
+    // but possible for /Game/ assets).
     std::wstring key(path);
     auto it = s_findObjectCache.find(key);
     if (it != s_findObjectCache.end() && it->second) {
@@ -1980,11 +2340,18 @@ void* findObject(const wchar_t* path) {
         s_findObjectCache.erase(it);
     }
 
+    // Primary: GUObjectArray walk. Robust on every UE fork because it
+    // depends only on UOBJ_NAME (0x18) / UOBJ_OUTER (0x20) / GUObjectArray
+    // layout - all stable and validated at bootstrap.
     if (void* result = findObjectViaScan(path)) {
         s_findObjectCache[key] = result;
         return result;
     }
 
+    // Fallback: pattern-scanned StaticFindObject. Only used on hosts where
+    // it's been validated to actually return correct objects (otherwise
+    // returns wrong things, e.g. AssetRegistry on Palworld). Uses the
+    // SEH-isolated helper so it can coexist with C++ unwinding objects.
     if (s_realStaticFindObject) {
         if (void* result = safeCallFindObject(s_realStaticFindObject, path)) {
             s_findObjectCache[key] = result;
@@ -1995,12 +2362,20 @@ void* findObject(const wchar_t* path) {
     return nullptr;
 }
 
-// Public API: loadAsset via AssetRegistry::GetAsset.
+// Public API: loadAsset (via AssetRegistry GetAsset)
+// Uses the DOCUMENTED FAssetData contract: PackageName + AssetName uniquely
+// identify an asset (operator==, GetTypeHash, IsValid all confirm this).
+// FastGetAsset only uses these two fields - no other state needed.
+// This is the same approach BPModLoaderMod uses in production.
 
 void* loadAsset(const wchar_t* assetPath) {
     if (!assetPath || !s_fnameConstructor || !s_processEvent) return nullptr;
     if (!s_assetRegHelpersCDO || !s_getAssetFunc) {
-        // Deferred retry: AR CDOs may not be loaded at HydroCore bootstrap.
+        // One-shot deferred retry: AR CDOs aren't in GUObjectArray during
+        // HydroCore bootstrap. Retry once here. This costs ~1s on a miss
+        // (full GUObjectArray walk), but happens at most once per
+        // loadAsset call - and after the FIRST success no further scans
+        // run because everything is cached/discovered.
         discoverAssetRegistry();
         if (!s_assetRegHelpersCDO || !s_getAssetFunc) {
             Hydro::logError("EngineAPI: AssetRegistry not initialized");
@@ -2033,21 +2408,28 @@ void* loadAsset(const wchar_t* assetPath) {
         assetPath, pkgFName.comparisonIndex, pkgFName.number,
         assetFName.comparisonIndex, assetFName.number);
 
+    // Read GetAsset's exact param layout from the UFunction (Layer 3 derived).
     uint16_t gaParmsSize = getUFunctionParmsSize(s_getAssetFunc);
     uint16_t gaRetOffset = getUFunctionRetOffset(s_getAssetFunc);
 
-    // Probe FAssetData field offsets at runtime (compiler layout can shift between builds).
+    // Read runtime field offsets from the FAssetData UScriptStruct rather
+    // than hardcoding them - compiler layout can shift between builds.
     int32_t pkgNameOffset = -1, assetNameOffset = -1;
     {
         void* firstProp = nullptr;
         safeReadPtr((uint8_t*)s_getAssetFunc + UFUNC_CHILD_PROPS, &firstProp);
         if (firstProp) {
+            // The UFunction's own property chain holds parameter entries, not
+            // the struct's members, so resolve FAssetData directly.
             void* assetDataStruct = safeCallLoadObject(s_staticFindObject, L"/Script/CoreUObject.AssetData", 0);
             if (!assetDataStruct)
                 assetDataStruct = safeCallLoadObject(s_staticFindObject, L"/Script/CoreUObject.ScriptStruct'/Script/CoreUObject.AssetData'", 0);
 
             if (assetDataStruct) {
                 Hydro::logInfo("EngineAPI: FAssetData UScriptStruct at %p", assetDataStruct);
+
+                // Walk the struct's property chain via accessors so it picks
+                // up Layer 2's discovered offsets transparently.
                 void* prop = getChildProperties(assetDataStruct);
                 int fieldIdx = 0;
                 while (prop && fieldIdx < 15) {
@@ -2069,17 +2451,24 @@ void* loadAsset(const wchar_t* assetPath) {
         }
     }
 
+    // Use hardcoded offsets (verified against C++ source) unless we find better
     if (pkgNameOffset < 0) pkgNameOffset = 0x00;
     if (assetNameOffset < 0) assetNameOffset = 0x10;
 
+    // Compute PackagePath = directory part of PackageName.
+    // /Game/Mods/TestMod/Sphere -> /Game/Mods/TestMod
     std::wstring pkgPathStr = packageName;
     auto lastSlash = pkgPathStr.find_last_of(L'/');
     if (lastSlash != std::wstring::npos) pkgPathStr = pkgPathStr.substr(0, lastSlash);
     FName8 pkgPathFName = {};
     safeConstructFName(&pkgPathFName, pkgPathStr.c_str());
 
-    // FAssetData: +0x00 PackageName, +0x08 PackagePath, +0x10 AssetName, +0x18 AssetClass
     uint8_t params[1024] = {};
+    // FAssetData layout (UE 5.x):
+    //   +0x00 FName PackageName
+    //   +0x08 FName PackagePath        <- required for GetAsset's load path
+    //   +0x10 FName AssetName
+    //   +0x18 FName AssetClass         <- left as 0; usually optional
     memcpy(params + pkgNameOffset, &pkgFName, 8);      // PackageName
     memcpy(params + 0x08,          &pkgPathFName, 8);  // PackagePath
     memcpy(params + assetNameOffset, &assetFName, 8);   // AssetName
@@ -2089,6 +2478,7 @@ void* loadAsset(const wchar_t* assetPath) {
         return nullptr;
     }
 
+    // Dump params AFTER ProcessEvent to check if our FNames survived initialization
     Hydro::logInfo("EngineAPI: GetAsset post-call (ParmsSize=%u, RetOff=%u):", gaParmsSize, gaRetOffset);
     for (int row = 0; row < 48; row += 16) {
         uint32_t* p = (uint32_t*)(params + row);
@@ -2101,6 +2491,9 @@ void* loadAsset(const wchar_t* assetPath) {
         return loadedAsset;
     }
 
+    // GetAsset returned null. Most common cause on runtime-mounted paks:
+    // AssetRegistry hasn't indexed the pak yet. Trigger an explicit scan
+    // of the package's parent directory (e.g. /Game/Mods/) and retry once.
     Hydro::logInfo("EngineAPI: GetAsset null - triggering AssetRegistry scan + retry");
     {
         // Compute the parent directory of the package: /Game/Mods/X/Pkg -> /Game/Mods/X
@@ -2126,12 +2519,29 @@ void* loadAsset(const wchar_t* assetPath) {
         Hydro::logInfo("EngineAPI: GetAsset still null after scan. Package '%ls' in memory: %p",
                        packageName.c_str(), findObject(packageName.c_str()));
 
-        // ScanFilesSynchronous fallback: try filesystem paths for known project names.
+        // -- ScanFilesSynchronous fallback (Palworld runtime-mount path) --
+        // ScanPathsSynchronous's virtual-path lookup relies on FPackageName's
+        // mount tree, which on Palworld doesn't contain entries for runtime-
+        // mounted paks (the pak-mount broadcast that should have called
+        // RegisterMountPoint never fires). ScanFilesSynchronous takes filesystem
+        // paths and may bypass that lookup - it reads the .uasset header to
+        // derive the package name. Try several candidate filename forms; if
+        // any indexes our content, GetAsset can then succeed on retry.
+        // Candidate forms (try each, retry GetAsset after):
+        //   1. "../../../Pal/Content/Mods/TestMod/Sphere.uasset" (engine virtual,
+        //       Palworld project name)
+        //   2. "../../../DummyModdableGame/Content/Mods/TestMod/Sphere.uasset"
+        //       (matches our test pak's MountPoint header if it was cooked for
+        //       DummyModdableGame)
         {
+            // Strip leading "/Game/" from package path -> "Mods/TestMod/Sphere"
             std::wstring pkgRel = packageName;
             const wchar_t kGamePrefix[] = L"/Game/";
             if (pkgRel.compare(0, 6, kGamePrefix) == 0) pkgRel = pkgRel.substr(6);
 
+            // Two candidate forms - Palworld project name first, then the cook-
+            // time project name from our test pak. Both as .uasset filesystem
+            // paths in the engine's virtual root format.
             const wchar_t* projectNames[] = { L"Pal", L"DummyModdableGame" };
             for (const wchar_t* projName : projectNames) {
                 std::wstring fsPath = std::wstring(L"../../../") + projName +
@@ -2143,6 +2553,7 @@ void* loadAsset(const wchar_t* assetPath) {
                     continue;
                 }
 
+                // Re-issue GetAsset after this candidate's scan
                 memset(params, 0, sizeof(params));
                 memcpy(params + pkgNameOffset, &pkgFName, 8);
                 memcpy(params + 0x08,          &pkgPathFName, 8);
@@ -2157,16 +2568,37 @@ void* loadAsset(const wchar_t* assetPath) {
                 }
                 Hydro::logInfo("EngineAPI:   GetAsset still null after ScanFilesSynchronous('%ls')", projName);
             }
-            Hydro::logInfo("EngineAPI: All ScanFilesSynchronous candidates exhausted");
+            Hydro::logInfo("EngineAPI: All ScanFilesSynchronous candidates exhausted - falling through to AR-state diagnostic");
         }
 
-        // AR-state diagnostic: walk GUObjectArray to see what pak content is loaded.
-        // One-shot per session.
+        // -- AR-state introspection diagnostic --
+        // We need to disambiguate three hypotheses about why GetAsset returns
+        // null on Palworld even after a successful ScanPathsSynchronous:
+        //   Claim A: ScanPathsSynchronous registered the asset metadata in
+        //     AR's map, but the package isn't loaded - GetAsset's internal
+        //     fallback to sync LoadPackage fails on Palworld (anchor strings
+        //     stripped). Fix: trigger an async load via a different UFunction.
+        //   Claim B: ScanPathsSynchronous registered NOTHING (Palworld AR
+        //     doesn't actually parse pak headers at runtime). AR map miss.
+        //     Fix: pre-load the package by some other means before scan.
+        //   Claim C: AR registered the metadata correctly, but our FAssetData
+        //     parameter buffer is malformed for Palworld's UE 5.1 layout.
+        //     Fix: rebuild FAssetData with reflected struct offsets.
+        // Diagnostic: walk GUObjectArray for ANY object whose full path
+        // contains '/Game/Mods/TestMod' (case-insensitive). If matches > 0,
+        // pak content IS loaded into memory - Claim B refuted; we then see
+        // exactly what's loaded and what isn't (e.g. UPackage but not
+        // Sphere_C, or vice versa). If matches == 0, nothing made it into
+        // GUObjectArray - strongly suggests Claim B.
+        // Bounded one-shot per session to avoid log spam.
         static bool s_arDiagDumped = false;
         if (!s_arDiagDumped) {
             s_arDiagDumped = true;
-            Hydro::logInfo("EngineAPI: AR-state diagnostic ── walking GUObjectArray for pak-content matches");
+            Hydro::logInfo("EngineAPI: AR-state diagnostic -- walking GUObjectArray for '/Game/Mods/TestMod' matches");
 
+            // Compute the prefix to match (everything up to the leaf segment
+            // of the path being loaded - e.g. /Game/Mods/TestMod for path
+            // /Game/Mods/TestMod/Sphere.Sphere_C). Case-folded for compare.
             std::wstring prefix = packageName;
             auto lastSlash = prefix.find_last_of(L'/');
             if (lastSlash != std::wstring::npos) prefix = prefix.substr(0, lastSlash);
@@ -2213,8 +2645,20 @@ void* loadAsset(const wchar_t* assetPath) {
                                    matches, obj2, clsName.c_str(), p.c_str());
                 }
             }
-            Hydro::logInfo("  RESULT: %d object(s) under prefix", matches);
+            if (matches == 0) {
+                Hydro::logInfo("  RESULT: NO objects in GUObjectArray under '%s' - pak content was not loaded into memory by scan or mount.", prefixNarrow.c_str());
+            } else {
+                Hydro::logInfo("  RESULT: %d object(s) under prefix found loaded - pak content IS in memory.", matches);
+            }
 
+            // -- UPackage census --
+            // Walk GUObjectArray for ALL UPackage instances. Tells us:
+            //   (a) Total package count: confirms our walk reaches everything
+            //   (b) Are there ANY /Game/Mods/* packages? (zero = mount broadcast
+            //       definitely didn't fire for runtime-mounted paks)
+            //   (c) Are there /Game/Pal/* packages? (baseline - base game
+            //       content; if zero, our walk is broken not the broadcast)
+            //   (d) First 10 UPackage paths: shows what's there
             int totalPkg = 0, gameModsPkg = 0, gamePalPkg = 0, scriptPkg = 0, gamePkg = 0;
             int firstPkgsLogged = 0;
             const int kMaxPkgsToLog = 10;
@@ -2232,6 +2676,7 @@ void* loadAsset(const wchar_t* assetPath) {
                 if (clsName != "Package") continue;
                 totalPkg++;
                 std::string p3 = getObjectPath(obj3);
+                // Pkg paths look like "/Game/Pal/...", "/Script/...", "/Game/Mods/..."
                 if (p3.find("/Game/Mods") != std::string::npos) gameModsPkg++;
                 else if (p3.find("/Game/Pal") != std::string::npos) gamePalPkg++;
                 else if (p3.find("/Script") != std::string::npos) scriptPkg++;
@@ -2244,17 +2689,20 @@ void* loadAsset(const wchar_t* assetPath) {
             Hydro::logInfo("  UPackage census: total=%d, /Game/Mods=%d, /Game/Pal=%d, /Script=%d, other /Game=%d",
                            totalPkg, gameModsPkg, gamePalPkg, scriptPkg, gamePkg);
             if (gameModsPkg == 0 && gamePalPkg > 0) {
-                Hydro::logInfo("  -> No /Game/Mods packages; base game is present. Mount broadcast likely missed.");
+                Hydro::logInfo("  -> Diagnosis: mount broadcast did NOT fire for runtime-mounted pak. Base game packages registered correctly (gamePal>0), but our pak's mount point was never broadcast. Need explicit FCoreDelegates::OnPakFileMounted2 broadcast OR FPackageName::RegisterMountPoint call.");
             } else if (gameModsPkg == 0 && gamePalPkg == 0) {
-                Hydro::logInfo("  -> No /Game/* packages at all. GUObjectArray walk may be incomplete.");
+                Hydro::logInfo("  -> Diagnosis: NO /Game/* packages found at all. Either GUObjectArray walk is incomplete, or AR is sealed for this entire path tree.");
             }
-            Hydro::logInfo("EngineAPI: AR-state diagnostic done ──");
+            Hydro::logInfo("EngineAPI: AR-state diagnostic done --");
         }
     }
 
     return nullptr;
 }
 
+// LoadPackage signature variants. We try the simpler 3-arg public variant
+// first, then the internal variant if needed. Both are SEH-wrapped because
+// pattern-scanning may have landed us on the wrong function on forked engines.
 using LoadPackageFn3 = void*(__fastcall*)(void* InOuter, const wchar_t* PackageName, uint32_t LoadFlags);
 
 static void* safeCallLoadPackage3(void* fn, const wchar_t* pkg, uint32_t flags) {
@@ -2433,19 +2881,49 @@ void* getProcessEventAddress() {
     return (void*)s_processEvent;
 }
 
-// Find AActor::DispatchBeginPlay by scanning for `call qword ptr [reg+BeginPlayVtableOffset]`
-// (FF /2 m32), narrowing to small functions with multiple callers.
+// --- AActor::DispatchBeginPlay discovery ---
+// Background: DispatchBeginPlay is the non-virtual engine funnel that every
+// actor's BeginPlay passes through. Hooking it catches every actor's begin-
+// play exactly once, regardless of subclass vtable overrides. Hooking the
+// virtual AActor::BeginPlay directly misses calls dispatched through
+// subclass vtables, which is why our earlier attempt produced zero fires.
+// We find DispatchBeginPlay by scanning for its distinctive last-instruction
+// shape: `call qword ptr [reg + BeginPlay_vtable_offset]`, where the offset
+// is whatever vtable slot AActor::BeginPlay occupies in the current engine
+// version (0x3A0 in UE 5.5). That instruction is 6 or 7 bytes of the form
+// `FF 9X XX XX XX XX` (ModRM byte 0x90..0x97 selects the register; no SIB).
+// A literal byte scan finds MANY matches - any function that does a virtual
+// call at that offset. To narrow to DispatchBeginPlay we also require:
+//   - exactly ONE such virtual call in the enclosing function
+//   - function size is small (DispatchBeginPlay is ~40-200 bytes)
+//   - the function is called by OTHER code in the module (non-leaf caller)
+// Candidates that pass are scored. The single best candidate wins. All
+// candidates are logged so a future engine version shift is debuggable.
 
+// Walk backwards from `at` looking for the function start. Heuristic: the
+// previous function ends with a RET (0xC3/0xC2) followed by alignment padding
+// (0xCC INT3 bytes). When we see that padding run, the byte after it is the
+// next function's entry. We cap the walk at 4KB to keep cost bounded.
 static uint8_t* findFunctionStartBackwards(uint8_t* at, uint8_t* modBase) {
     uint8_t* p = at;
     uint8_t* limit = (p > modBase + 4096) ? p - 4096 : modBase;
     for (; p > limit; p--) {
+        // Look for the pattern: RET (0xC3 or 0xC2 xx xx) followed by 0xCC padding.
+        // The candidate function starts right after the padding run.
         if (p[0] == 0xCC) {
+            // Walk forward past the padding run to the first non-CC byte.
             uint8_t* q = p;
             while (q < at && *q == 0xCC) q++;
+            // Preceded by a RET or near-RET instruction? Check a few bytes back.
+            // C3 = RET, C2 xx xx = RET imm16, E9 xx xx xx xx = JMP rel32 (tail call)
             uint8_t prev = (p > modBase) ? *(p - 1) : 0;
-            if (prev == 0xC3 || prev == 0xCC) return q;
-            if (p > modBase + 5 && *(p - 5) == 0xE9) return q;
+            if (prev == 0xC3 || prev == 0xCC) {
+                return q;
+            }
+            // Also accept "JMP rel32" as function boundary (tail-call ending)
+            if (p > modBase + 5 && *(p - 5) == 0xE9) {
+                return q;
+            }
         }
     }
     return nullptr;
@@ -2454,12 +2932,18 @@ static uint8_t* findFunctionStartBackwards(uint8_t* at, uint8_t* modBase) {
 struct DbpCandidate {
     uint8_t* funcStart;
     size_t approxSize;
-    int virtualCalls;
-    int flagWrites;
-    int callers;
+    int virtualCalls;    // count of call [reg+offset] matching the target offset
+    int flagWrites;      // count of mov byte ptr [reg+N], imm8 (actor flag sets)
+    int callers;         // count of direct E8 calls targeting this function
     int score;
 };
 
+// Count direct CALL instructions (E8 rel32) targeting `target` across a
+// subset of the module. DispatchBeginPlay has multiple callers (at least
+// UWorld::InitializeActorsForPlay and AActor::PostActorConstruction), so
+// a callers count of 0 rules out many false positives. We cap the search
+// region so this doesn't blow the frame budget on a module that might be
+// hundreds of MB.
 static int countDirectCallers(uint8_t* target, uint8_t* modBase, size_t modSize) {
     int count = 0;
     const size_t kMaxScan = 64 * 1024 * 1024;  // 64MB - plenty for .text
@@ -2514,8 +2998,12 @@ void* findDispatchBeginPlay(int beginPlayVtableOffset) {
         c.virtualCalls++;
     }
 
+    // Pass 3a: cheap structural scoring for every unique candidate (local
+    // only - no full-module scans). This trims the field before we spend
+    // effort counting direct callers, which is quadratic otherwise.
     std::vector<DbpCandidate*> scored;
     for (auto& [start, c] : candidates) {
+        // Approximate function size: scan forward until first RET + padding.
         size_t maxScan = 512;
         size_t fnLen = 0;
         for (size_t j = 0; j < maxScan && (start + j) < (mod + modSize); j++) {
@@ -2527,6 +3015,9 @@ void* findDispatchBeginPlay(int beginPlayVtableOffset) {
         if (fnLen == 0) fnLen = 64;  // unknown; assume reasonable
         c.approxSize = fnLen;
 
+        // Flag writes: count `mov byte ptr [reg+N], imm8` patterns (C6 4X NN II)
+        // inside the function. DispatchBeginPlay writes the HasActorBegunPlay
+        // bitfield before calling BeginPlay.
         for (size_t j = 0; j + 4 < fnLen; j++) {
             if (start[j] == 0xC6 && (start[j + 1] & 0xF0) == 0x40) {
                 c.flagWrites++;
@@ -2547,11 +3038,22 @@ void* findDispatchBeginPlay(int beginPlayVtableOffset) {
                   return a->approxSize < b->approxSize;
               });
 
+    // Pass 3b: count direct callers only for the top 10 - keeps the scan
+    // bounded regardless of total candidate count. 10 is plenty because
+    // the cheap pre-rank puts the right candidate near the top.
     size_t deepScan = scored.size() < 10 ? scored.size() : (size_t)10;
     for (size_t i = 0; i < deepScan; i++) {
         scored[i]->callers = countDirectCallers(scored[i]->funcStart, mod, modSize);
     }
 
+    // Score all candidates. Rubric:
+    //   +1000 if exactly 1 virtual call at the offset (DispatchBeginPlay
+    //         invokes BeginPlay exactly once - functions with many such
+    //         calls are almost certainly something else)
+    //   +200 per caller (non-leaf -> more likely a dispatch funnel)
+    //   +100 if function is reasonably sized (32..256 bytes)
+    //   +50 per flag write (up to 3)
+    //   -200 if function is very large (>400 bytes; DispatchBeginPlay is tight)
     for (auto* cp : scored) {
         DbpCandidate& c = *cp;
         c.score = 0;
@@ -2562,6 +3064,7 @@ void* findDispatchBeginPlay(int beginPlayVtableOffset) {
         if (c.approxSize > 400) c.score -= 200;
     }
 
+    // Sort by score descending, log top candidates for debuggability.
     std::sort(scored.begin(), scored.end(),
               [](const DbpCandidate* a, const DbpCandidate* b) { return a->score > b->score; });
 
@@ -2590,6 +3093,9 @@ void* findDispatchBeginPlay(int beginPlayVtableOffset) {
 static bool callProcessEvent(void* obj, void* func, void* params) {
     if (!obj || !func) return false;
 
+    // Virtual call through the TARGET object's own vtable - matches how
+    // UE4SS and the engine itself call ProcessEvent. Different classes
+    // may have different ProcessEvent implementations.
     void** vtable = *(void***)obj;
     if (!vtable) return false;
     auto pe = (ProcessEventFn)vtable[VTABLE_PROCESS_EVENT];
@@ -2618,7 +3124,11 @@ static bool callProcessEvent(void* obj, void* func, void* params) {
     return true;
 }
 
-// BeginDeferredActorSpawnFromClass param offsets, derived from the UFunction property chain.
+// Cached param offsets for BeginDeferredActorSpawnFromClass. Looked up once
+// per session via the UFunction's property chain, so the layout is correct
+// for whichever UE 5.x build the host uses (UE 5.1 / 5.5 / 5.6 may shift
+// alignment or insert/remove flags). Using static + sentinel; -1 means
+// "not yet resolved" so we re-attempt on first spawn after engine init.
 struct SpawnParamLayout {
     bool resolved = false;
     int32_t worldOff = -1;
@@ -2635,6 +3145,7 @@ static SpawnParamLayout s_spawnLayout;
 static void resolveSpawnLayout() {
     if (s_spawnLayout.resolved) return;
     if (!s_spawnFunc) return;
+    // BeginDeferredActorSpawnFromClass param names (must match UE source):
     auto off = [](const wchar_t* n) -> int32_t {
         void* prop = findProperty(s_spawnFunc, n);
         return prop ? getPropertyOffset(prop) : -1;
@@ -2669,6 +3180,8 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
         return nullptr;
     }
 
+    // Refresh world pointer before each spawn - the world may have changed
+    // since initialize() ran (e.g., map transition from menu to gameplay).
     refreshWorld();
     if (!s_world) {
         Hydro::logError("EngineAPI: No valid UWorld found");
@@ -2677,12 +3190,30 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
 
     Hydro::logInfo("EngineAPI: Spawning actor at (%.0f, %.0f, %.0f) in world %p...", x, y, z, s_world);
 
+    // Resolve param offsets via reflection on first call. If the property
+    // chain isn't readable yet (e.g., very early init), fall back to the
+    // hardcoded UE 5.5 layout so existing UE 5.5 paths still work.
     resolveSpawnLayout();
 
     if (s_spawnLayout.resolved && s_spawnLayout.totalSize <= 256) {
-        // WorldContext must be an in-world actor instance. UWorld* itself and CDOs fail
-        // GetWorldFromContextObject() on some UE 5.5 builds.
-        // RF_ClassDefaultObject = 0x10 (stable across UE versions).
+        // BeginDeferredActorSpawnFromClass has meta=(WorldContext="WorldContextObject")
+        // - UE's GetWorldFromContextObject() calls obj->GetWorld() and expects
+        // the object to BE in a world. UWorld::GetWorld() returns nullptr in
+        // some UE 5.5 builds (DMG ThirdPersonMap empirically), causing access
+        // violation deep in the spawn code. Prefer a player Pawn/Character
+        // as WorldContext (canonical BP-callable pattern).
+        // WorldContext resolution. UE's GetWorldFromContextObject expects an
+        // object that's IN a world (i.e. an actor instance). A UWorld* itself
+        // does not satisfy this (DMG UE 5.5 empirically crashes). A CDO
+        // also fails (returns null GetWorld). We need a real in-world actor.
+        // Strategy: prime the find cache by calling findFirstOf once (which
+        // resolves the UClass* via GUObjectArray walk - may return a CDO),
+        // then call again - the second call routes through
+        // UGameplayStatics::GetAllActorsOfClass, which ONLY returns
+        // in-world instances, never CDOs.
+        // Helper: detect Class Default Object via UObject flags. RF_ClassDefaultObject
+        // = 0x10 - stable across UE versions. CDOs have no world (GetWorld()
+        // returns null), so passing one as WorldContext fails the spawn.
         auto isCDO = [](void* obj) {
             if (!obj) return true;
             uint32_t flags = 0;
@@ -2693,6 +3224,15 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
         void* worldContext = nullptr;
         const char* wcSource = nullptr;
 
+        // Walk GUObjectArray to find a non-CDO actor instance. We can't rely
+        // on findFirstOf("Character") because:
+        //   - It matches by class-of-obj, so the very first object with class
+        //     Character is `Default__Character` (the CDO).
+        //   - getAllActorsOfClass on the *generic* Character class may return
+        //     0 (the player is a DMG-specific subclass like
+        //     DummyModdableGameCharacter), causing fallback to GUObjectArray
+        //     walk that re-picks the CDO.
+        // Direct walk + CDO filter is the resilient option.
         if (s_guObjectArray) {
             int32_t count = getObjectCount();
             for (int32_t i = 0; i < count && !worldContext; i++) {
@@ -2701,6 +3241,7 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
                 void* cls = getObjClass(obj);
                 if (!cls) continue;
                 if (!isActorSubclass(cls)) continue;
+                // Found a non-CDO actor instance with a class chain through AActor.
                 worldContext = obj;
                 wcSource = "GUObjectArray walk (non-CDO actor instance)";
             }
@@ -2715,8 +3256,10 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
         }
         if (!worldContext) {
             worldContext = s_world;
-            wcSource = "UWorld* (last resort)";
+            wcSource = "UWorld* (last-resort fallback - likely to crash)";
         }
+        // Diagnostic: print WorldContext object name + class name so we can
+        // see whether we picked a real in-world actor or a CDO/template.
         if (worldContext) {
             uint32_t wcNameIdx = 0;
             safeReadInt32((uint8_t*)worldContext + UOBJ_NAME, (int32_t*)&wcNameIdx);
@@ -2727,6 +3270,7 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
             std::string wcClassName = wcClass ? getNameString(wcClassNameIdx) : "<null>";
             uint32_t wcFlags = 0;
             safeReadInt32((uint8_t*)worldContext + UOBJ_FLAGS, (int32_t*)&wcFlags);
+            // Diagnostic on actor class too
             uint32_t acNameIdx = 0;
             safeReadInt32((uint8_t*)actorClass + UOBJ_NAME, (int32_t*)&acNameIdx);
             std::string acName = getNameString(acNameIdx);
@@ -2742,17 +3286,20 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
             Hydro::logInfo("EngineAPI: WorldContext for spawn = %p (%s)",
                 worldContext, wcSource);
         }
-        // FTransform layout (stable across UE 5.x, double-precision):
-        //   FQuat at +0x00 (32 bytes), Translation at +0x20, Scale3D at +0x40
+        // Reflection-derived param block - version-resilient path.
         alignas(16) uint8_t params[256] = {};
         *(void**)(params + s_spawnLayout.worldOff) = worldContext;
         *(void**)(params + s_spawnLayout.classOff) = actorClass;
+        // FTransform: FQuat at +0x00 (32 bytes), Translation FVector at +0x20
+        // (24+8 pad = 32 bytes), Scale3D FVector at +0x40 (24+8 pad). Total
+        // 96 bytes, double-precision (UE 5.x default since 5.0). Layout
+        // within FTransform itself is stable across UE 5.x.
         uint8_t* tx = params + s_spawnLayout.transformOff;
         *(double*)(tx + 0x00) = 0.0;  // QuatX
         *(double*)(tx + 0x08) = 0.0;  // QuatY
         *(double*)(tx + 0x10) = 0.0;  // QuatZ
         *(double*)(tx + 0x18) = 1.0;  // QuatW (identity)
-        *(double*)(tx + 0x20) = x;
+        *(double*)(tx + 0x20) = x;    // TranslationX
         *(double*)(tx + 0x28) = y;
         *(double*)(tx + 0x30) = z;
         *(double*)(tx + 0x40) = 1.0;  // ScaleX
@@ -2764,6 +3311,7 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
             *(void**)(params + s_spawnLayout.ownerOff) = nullptr;
         if (s_spawnLayout.scaleMethodOff >= 0)
             *(uint8_t*)(params + s_spawnLayout.scaleMethodOff) = 1;  // MultiplyWithRoot
+        // ReturnValue slot is zero already.
 
         if (!callProcessEvent(s_gameplayStaticsCDO, s_spawnFunc, params)) {
             Hydro::logError("EngineAPI: BeginDeferredActorSpawnFromClass failed (reflection path, ProcessEvent crashed)");
@@ -2777,6 +3325,7 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
             return nullptr;
         }
 
+        // FinishSpawningActor - derive its param layout reflectively too.
         if (s_finishSpawnFunc) {
             int32_t fsActorOff = -1, fsTxOff = -1, fsScaleOff = -1;
             uint16_t fsTotal = getUFunctionParmsSize(s_finishSpawnFunc);
@@ -2811,17 +3360,18 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
         return result;
     }
 
-    // Fallback: hardcoded UE 5.5 layout.
+    // Fallback: hardcoded UE 5.5 layout (legacy path, kept for cache-load
+    // case where reflection chain isn't walked yet on this session).
     Hydro::logWarn("EngineAPI: SpawnParams reflection unavailable; using hardcoded UE 5.5 layout");
     SpawnParams sp = {};
     sp.worldContext = s_world;
     sp.actorClass = actorClass;
-    sp.rotX = 0.0; sp.rotY = 0.0; sp.rotZ = 0.0; sp.rotW = 1.0;
+    sp.rotX = 0.0; sp.rotY = 0.0; sp.rotZ = 0.0; sp.rotW = 1.0; // identity quat
     sp.locX = x; sp.locY = y; sp.locZ = z;
     sp.scaleX = 1.0; sp.scaleY = 1.0; sp.scaleZ = 1.0;
-    sp.collisionMethod = 1;  // AlwaysSpawn
+    sp.collisionMethod = 1; // AlwaysSpawn (enum value 1, NOT 3)
     sp.owner = nullptr;
-    sp.scaleMethod = 1;  // MultiplyWithRoot
+    sp.scaleMethod = 1; // MultiplyWithRoot
     sp.returnValue = nullptr;
 
     if (!callProcessEvent(s_gameplayStaticsCDO, s_spawnFunc, &sp) || !sp.returnValue) {
@@ -2829,17 +3379,20 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
         return nullptr;
     }
 
+    // FinishSpawningActor - completes construction, registers components, dispatches BeginPlay
     if (s_finishSpawnFunc) {
+        // Params: Actor(0x00), pad(0x08), FTransform(0x10-0x6F), ScaleMethod(0x70), ReturnValue(0x78)
         alignas(16) uint8_t fsParams[512] = {};
         *(void**)(fsParams + 0x00) = sp.returnValue;
+        // FTransform: FQuat(0x10) + FVector Translation(0x30) + FVector Scale3D(0x50)
         *(double*)(fsParams + 0x10) = 0.0;
         *(double*)(fsParams + 0x18) = 0.0;
         *(double*)(fsParams + 0x20) = 0.0;
-        *(double*)(fsParams + 0x28) = 1.0;
+        *(double*)(fsParams + 0x28) = 1.0; // identity quat W
         *(double*)(fsParams + 0x30) = x;
         *(double*)(fsParams + 0x38) = y;
         *(double*)(fsParams + 0x40) = z;
-        *(double*)(fsParams + 0x50) = 1.0;
+        *(double*)(fsParams + 0x50) = 1.0; // Scale3D
         *(double*)(fsParams + 0x58) = 1.0;
         *(double*)(fsParams + 0x60) = 1.0;
         *(uint8_t*)(fsParams + 0x70) = 1;  // MultiplyWithRoot
@@ -2852,7 +3405,7 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
     return sp.returnValue;
 }
 
-// Player / actor lookups via GameplayStatics UFunctions
+// --- UE-indexed player / actor lookups ---
 // Instead of scanning GUObjectArray (~900k objects) to find the player
 // or all actors of a class, call UE's own hash/index-backed UFunctions.
 // These are how blueprint and engine code do the same operations, so they
@@ -2912,11 +3465,27 @@ int getAllActorsOfClass(void* actorClass, void** outArray, int maxResults) {
     refreshWorld();
     if (!s_world) return 0;
 
-    // Params: WorldContext(0x00), ActorClass(0x08), OutActors TArray(0x10).
-    // Zero TArray - UE allocates the backing buffer internally.
+    // GetAllActorsOfClass signature:
+    //   static void GetAllActorsOfClass(UObject* WorldContext, TSubclassOf<AActor> ActorClass,
+    //                                   TArray<AActor*>& OutActors);
+    // Params layout (roughly):
+    //   0x00: WorldContextObject (UObject*)
+    //   0x08: ActorClass (UClass*)
+    //   0x10: OutActors - a TArray (Data ptr, Num, Max) - we populate the struct's
+    //         memory so UE can grow it; but the easier pattern used by UE internally
+    //         is "pass a TArray by ref and UE appends". We allocate a temp array
+    //         buffer and pre-seed the TArray to point at it.
+    // Simplest safe approach: zero-initialized TArray; UE allocates the backing
+    // buffer via its own TArray::Reserve on append. After the call, read the
+    // Data/Num fields and copy the pointers into outArray, then free the
+    // UE-allocated buffer - except freeing requires UE's allocator, which we
+    // don't have direct access to. Small leak each call. Acceptable for MVP;
+    // proper fix uses UE's FMemory_Free or ArrayDestructor later.
+
     alignas(16) uint8_t params[256] = {};
     *(void**)(params + 0x00) = s_world;
     *(void**)(params + 0x08) = actorClass;
+    // Zero TArray at +0x10 (Data=nullptr, Num=0, Max=0) - UE will allocate.
 
     if (!callProcessEvent(s_gameplayStaticsCDO, s_getAllActorsOfClassFunc, params))
         return 0;
@@ -2932,6 +3501,8 @@ int getAllActorsOfClass(void* actorClass, void** outArray, int maxResults) {
     }
     return copied;
 }
+
+// Reflection API (public wrappers around internal helpers)
 
 void* getClass(void* obj) {
     if (!obj) return nullptr;
@@ -2950,8 +3521,11 @@ void* findProperty(void* uclass, const wchar_t* propName) {
     FName8 targetName = {};
     if (!safeConstructFName(&targetName, propName)) return nullptr;
 
-    // Walk ChildProperties, then up the SuperStruct chain. Uses discovered Layer 2
-    // offsets (fallback to hardcoded) to handle UE fork shifts.
+    // Walk ChildProperties on this class, then up the SuperStruct chain.
+    // Inherited properties (e.g. AActor::RootComponent on an ACharacter
+    // instance) live on ancestor classes' FField list, not the subclass.
+    // Use discovered chain-walk offsets (Layer 2) with hardcoded fallback -
+    // Palworld's UE 5.1.x fork shifts these by +8 bytes vs. stock UE 5.5.
     int chOff   = (s_layout.childPropsOffset >= 0) ? s_layout.childPropsOffset : USTRUCT_CHILD_PROPS;
     int nextOff = (s_layout.fieldNextOffset  >= 0) ? s_layout.fieldNextOffset  : FFIELD_NEXT;
     int nameOff = (s_layout.fieldNameOffset  >= 0) ? s_layout.fieldNameOffset  : FFIELD_NAME;
@@ -2990,6 +3564,23 @@ bool callFunction(void* obj, void* func, void* params) {
     return callProcessEvent(obj, func, params);
 }
 
+// Lazy-init s_gm for callers (e.g. PakLoader) running before initialize().
+static void ensureGameModuleResolved() {
+    if (!s_gm.base) s_gm = findGameModule();
+}
+uint8_t* getGameModuleBase() { ensureGameModuleResolved(); return s_gm.base; }
+size_t   getGameModuleSize() { ensureGameModuleResolved(); return s_gm.size; }
+
+// Built-in RawFn descriptors so adjacent modules can resolve("X") directly.
+static void seedAndResolveRawFunctions() {
+    using namespace ::Hydro::Engine::RawFn;
+    registerFn("ProcessInternal", { Strategy::UFuncImpl,
+        L"/Script/CoreUObject.Object:ExecuteUbergraph", 0 });
+    registerFn("StaticLoadObject", { Strategy::StringRefAnchor,
+        L"Failed to find object", 0 });
+    resolveAllRegistered();
+}
+
 bool readPtr(void* addr, void** out) {
     return safeReadPtr(addr, out);
 }
@@ -2998,7 +3589,9 @@ bool readInt32(void* addr, int32_t* out) {
     return safeReadInt32(addr, out);
 }
 
-constexpr int FFIELD_CLASS = 0x08;  // FField::ClassPrivate (FFieldClass*)
+// FField layout: +0x08 = FFieldClass* ClassPrivate
+// FFieldClass layout: +0x00 = FName Name
+constexpr int FFIELD_CLASS = 0x08;
 
 uint32_t getPropertyTypeNameIndex(void* prop) {
     if (!prop) return 0;
@@ -3051,6 +3644,8 @@ uint32_t makeFName(const wchar_t* str) {
     return name.comparisonIndex;
 }
 
+// Property type names
+
 static PropertyTypeNames s_propTypeNames = {};
 
 bool initPropertyTypeNames() {
@@ -3086,15 +3681,15 @@ const PropertyTypeNames& getPropertyTypeNames() {
 }
 
 // Object discovery (GUObjectArray iteration)
-//
-// Three optimisations stack here:
-//   1. Resolve className -> UClass* once, then compare obj->class pointers
-//      instead of reading each obj->class->name every iteration.
-//   2. Raw reads in the hot loop under one SEH block, not per-read. The
-//      UOBJ_CLASS/UOBJ_NAME offsets are validated at bootstrap.
-//   3. Cache the last found instance. A warm call only reads instance->class
-//      to validate, then returns immediately.
-// Cold call ~10ms, warm call ~nanoseconds (was ~1s).
+// Performance notes (see memory: hydrocore_find_performance):
+//   Layer 1 - resolve className -> UClass* once, then compare obj->class
+//             to that pointer instead of reading each obj->class->name.
+//   Layer 2 - raw reads in the hot loop under one SEH block, not per-read.
+//             The UOBJ_CLASS/UOBJ_NAME offsets are validated at bootstrap;
+//             once validated, per-object reads at those offsets are safe.
+//   Layer 3 - cache last found instance. A warm call only does ONE read
+//             (instance->class) to validate, then returns instantly.
+// Combined: cold call ~10ms, warm call ~nanoseconds vs. ~1s previously.
 
 struct FindCacheEntry {
     uint32_t targetNameIdx = 0;
@@ -3103,6 +3698,9 @@ struct FindCacheEntry {
 };
 static std::unordered_map<std::wstring, FindCacheEntry> s_findCache;
 
+/// Validate a cached instance pointer with a single SEH-wrapped read:
+/// if instance->class still equals the cached UClass*, the cache is good.
+/// Catches the common invalidation cases (GC'd object, class mismatch).
 static bool validateCachedInstance(void* instance, void* expectedClass) {
     if (!instance || !expectedClass) return false;
     void* cls = nullptr;
@@ -3110,6 +3708,14 @@ static bool validateCachedInstance(void* instance, void* expectedClass) {
     return cls == expectedClass;
 }
 
+/// Core scan. If targetClass is non-null, does a fast pointer-compare on
+/// obj->class. Otherwise falls back to matching obj->class->nameIdx. On
+/// match, writes the object pointer to *outFirst and/or appends to outAll.
+/// Returns number of matches (or 1 and short-circuits if outAll is null).
+///
+/// Raw reads throughout - wrapped in a single __try that falls through on
+/// access violation (e.g. torn chunk mid-GC), returning whatever matches
+/// we'd found up to that point.
 static int fastScan(uint32_t targetNameIdx, void* targetClass,
                     void** outFirst, void** outAll, int maxResults,
                     void** outResolvedClass) {
@@ -3157,13 +3763,22 @@ static int fastScan(uint32_t targetNameIdx, void* targetClass,
             if (outAll && found >= maxResults) break;
         }
 #ifdef _WIN32
-    } __except (1) { /* fault mid-scan - return what we have */ }
+    } __except (1) {
+        // Fault mid-scan (rare: chunk torn by concurrent GC). Return what
+        // we have so far - caller treats zero matches as "not found".
+    }
 #endif
     return found;
 }
 
-static void* s_actorClassPtr = nullptr;  // Cached AActor UClass*
+// Cached AActor UClass*. Resolved lazily via findObject once StaticFindObject
+// is up; nullable (returns false from isActorSubclass until it resolves).
+static void* s_actorClassPtr = nullptr;
 
+// Does `uclass` descend from AActor? Walks the SuperStruct chain, bounded.
+// Used by findFirstOf/findAllOf to route actor queries through UE's own
+// O(instances) actor iteration (GetAllActorsOfClass) instead of scanning
+// all ~77k live UObjects.
 static bool isActorSubclass(void* uclass) {
     if (!uclass) return false;
     if (!s_actorClassPtr) {
@@ -3182,7 +3797,11 @@ static bool isActorSubclass(void* uclass) {
     return false;
 }
 
-// Find a non-CDO actor instance for use as UFunction WorldContext.
+// Walk GUObjectArray for a non-CDO actor instance suitable as a UFunction
+// WorldContext. UE's GetWorldFromContextObject expects an object that's IN
+// a world; UWorld* itself fails on some 5.5 builds (DMG empirically), and
+// CDOs always fail. Used by spawn / GetPlayerCharacter / GetPlayerPawn.
+// Returns nullptr if no in-world actor exists yet (very early init).
 static void* findInWorldActor() {
     if (!s_guObjectArray) return nullptr;
     int32_t count = getObjectCount();
@@ -3205,6 +3824,9 @@ void* findFirstOf(const wchar_t* className) {
     std::wstring key(className);
     auto& entry = s_findCache[key];
 
+    // Warm path: we've seen this class before AND still have a recent
+    // instance. Validate with one read; if it's still the same class,
+    // return immediately (near-zero cost).
     if (entry.lastInstance &&
         validateCachedInstance(entry.lastInstance, entry.uclass))
         return entry.lastInstance;
@@ -3309,13 +3931,24 @@ int getNetMode() {
     return static_cast<int>(params[retOff]);
 }
 
-// FProperty::PropertyFlags fallback offset (stock UE 5.5; runtime-discovered value takes precedence).
+// FProperty::PropertyFlags fallback (uint64 at +0x38 in stock UE 5.5).
+// The real offset is discovered at runtime - see s_layout / discoverPropertyLayout.
 constexpr int FPROP_FLAGS = 0x38;
 
-// Reflection-driven FProperty layout discovery.
-// Probes FProperty::Offset_Internal, ElementSize, and PropertyFlags offsets
-// against AActor anchors (PrimaryActorTick, RootComponent, Tags). Results
-// live in s_layout; hardcoded constants are fallbacks.
+// -- Layer 2: reflection-driven FProperty layout discovery ---
+// Stock UE 5.5 has FProperty::Offset_Internal at +0x44, ElementSize at +0x34,
+// PropertyFlags at +0x38 - but Pocketpair's Palworld fork (UE 5.1.x base) and
+// other forked-engine hosts shift these. Hardcoding them gives RootComponent
+// reads as nil, K2_GetActorLocation EXCEPTION_ACCESS_VIOLATION on host, etc.
+// We probe the layout once at first use against a known-good anchor:
+// AActor::PrimaryActorTick (a StructProperty wrapping FTickFunction), with
+// AActor::RootComponent (TObjectPtr, ElementSize=8) and AActor::Tags
+// (TArray<FName>, ElementSize=16) as cross-checks. The candidate offset
+// triple that yields sane values across all three properties wins.
+// Discovered values live in s_layout (declared near the top, alongside the
+// scan cache that persists them). Hardcoded constants stay as fallbacks if
+// discovery hasn't run or fails. The accessors read s_layout.* with the
+// hardcoded constants as fallback.
 
 // Read a uint64 with SEH guard.
 static bool safeReadU64(void* addr, uint64_t* out) {
@@ -3440,8 +4073,9 @@ bool discoverPropertyLayout() {
     if (s_layout.initialized) return s_layout.succeeded;
     s_layout.initialized = true;
 
-    // Use GUObjectArray scan rather than StaticFindObject - Palworld returns
-    // the wrong object (/Script/AssetRegistry UPackage) for /Script/Engine.Actor.
+    // Resolve AActor's UClass by direct GUObjectArray scan rather than
+    // StaticFindObject - Palworld's findObject path returns the wrong
+    // object (UPackage /Script/AssetRegistry) for /Script/Engine.Actor.
     void* actorClass = findActorClassViaScan();
     if (!actorClass) {
         // Fallback: try the (possibly-broken) findObject as a last resort.
@@ -3453,7 +4087,10 @@ bool discoverPropertyLayout() {
         return false;
     }
 
-    // Stage A: pre-resolve known AActor property name FName indices.
+    // -- Stage A: pre-resolve known AActor property name FName indices --
+    // We can construct FNames at this point (FName ctor was discovered
+    // during pattern-scan). These names are present on AActor in every UE5
+    // version we know of.
     static const wchar_t* kKnownActorProps[] = {
         L"PrimaryActorTick",
         L"RootComponent",
@@ -3480,11 +4117,16 @@ bool discoverPropertyLayout() {
         Hydro::logWarn("EngineAPI: Layer 2 probe failed - couldn't resolve AActor property name FNames");
         return false;
     }
+    // Diagnostic: dump expected names and their resolved FName indices.
     Hydro::logInfo("EngineAPI: Layer 2 expected names (%d resolved):", expectedReady);
     for (int i = 0; i < expectedReady; i++) {
         Hydro::logInfo("  '%ls' = idx %u", kKnownActorProps[i], expectedNames[i]);
     }
 
+    // Diagnostic: validate actorClass identity. Read its UOBJ_NAME (FName
+    // index at +0x18) and the FName index of its OWN class via UOBJ_CLASS
+    // (+0x10) -> that class' name. AActor's UClass should report name="Actor"
+    // and its meta-class should report name="Class".
     {
         uint32_t selfNameIdx = 0;
         safeReadInt32((uint8_t*)actorClass + UOBJ_NAME, (int32_t*)&selfNameIdx);
@@ -3498,6 +4140,9 @@ bool discoverPropertyLayout() {
                        selfName.c_str(), selfNameIdx, metaCls, metaName.c_str(), metaNameIdx);
     }
 
+    // Diagnostic: dump 8-byte slots from 0x00 through 0x180 - UClass on UE5
+    // is hundreds of bytes (vtable + UObject base + UField + UStruct + UClass
+    // members). We need to see the full picture to find ChildProperties.
     Hydro::logInfo("EngineAPI: Layer 2 actorClass=%p; full UClass slot dump:", actorClass);
     for (int off = 0x00; off <= 0x180; off += 8) {
         void* p = nullptr;
@@ -3507,6 +4152,9 @@ bool discoverPropertyLayout() {
         }
         uintptr_t v = (uintptr_t)p;
         bool inMod = ((uint8_t*)p >= s_gm.base && (uint8_t*)p < s_gm.base + s_gm.size);
+        // Real Windows x64 user-mode heap pointers live above ~0x10000000000
+        // and have nonzero bytes throughout - sentinels typically have
+        // (low32==0 || high32==0).
         uint32_t lo = (uint32_t)(v & 0xFFFFFFFFULL);
         uint32_t hi = (uint32_t)(v >> 32);
         bool heapLike = !inMod && hi != 0 && lo != 0 && hi < 0x10000U;
@@ -3514,8 +4162,12 @@ bool discoverPropertyLayout() {
         Hydro::logInfo("  +0x%02X: %p%s", off, p, tag);
     }
 
-    // Stage B: probe (USTRUCT_CHILD_PROPS, FFIELD_NEXT, FFIELD_NAME) triples.
-    // Stock UE 5.5: (0x50, 0x18, 0x20). Palworld fork: (0x58, 0x20, 0x28).
+    // -- Stage B: probe (USTRUCT_CHILD_PROPS, FFIELD_NEXT, FFIELD_NAME) --
+    // Walk AActor's child chain with each candidate triple; the combo with
+    // the most matches against `expectedNames` wins. Stock UE 5.5 lands on
+    // (0x50, 0x18, 0x20). Palworld's fork shifts these by +8 bytes ->
+    // (0x58, 0x20, 0x28). Other forks may differ - extend candidates as
+    // new hosts surface.
     static const int kChildProps[] = { 0x50, 0x58, 0x48, 0x60, 0x40 };
     static const int kFieldNext[]  = { 0x18, 0x20, 0x28, 0x10, 0x30 };
     static const int kFieldName[]  = { 0x20, 0x28, 0x30, 0x18, 0x38 };
@@ -3533,6 +4185,8 @@ bool discoverPropertyLayout() {
         Hydro::logInfo("EngineAPI: Layer 2 trying CH=0x%X firstProp=%p", ch, firstProp);
 
         for (int nm : kFieldName) {
+            // Probe the first-element name at each candidate name offset to
+            // surface what's actually stored there - even before counting hits.
             uint32_t firstIdx = 0;
             if (safeReadInt32((uint8_t*)firstProp + nm, (int32_t*)&firstIdx) && firstIdx != 0) {
                 std::string fname = (firstIdx <= 0x7FFFFFFF) ? getNameString(firstIdx) : std::string("<garbage>");
@@ -3573,7 +4227,9 @@ bool discoverPropertyLayout() {
                        "(stock: CH=0x%X NEXT=0x%X NAME=0x%X)",
                        USTRUCT_CHILD_PROPS, FFIELD_NEXT, FFIELD_NAME);
 
-    // Stage C: with discovered chain offsets, find anchor properties.
+    // -- Stage C: with chain offsets in hand, find anchor properties --
+    // findProperty now uses s_layout.{childProps,fieldNext,fieldName} - so
+    // this works even if the host has shifted offsets.
     void* tickProp = findProperty(actorClass, L"PrimaryActorTick");
     void* rootProp = findProperty(actorClass, L"RootComponent");
     void* tagsProp = findProperty(actorClass, L"Tags");
@@ -3585,7 +4241,10 @@ bool discoverPropertyLayout() {
         return false;
     }
 
-    // Stage D: probe FPROP_OFFSET_INTERNAL - must be 4-byte aligned, < 8KB, distinct per anchor.
+    // -- Stage D: probe FPROP_OFFSET_INTERNAL --
+    // Each prop's offset must be 4-byte aligned, < 8KB, distinct between
+    // PrimaryActorTick / RootComponent / Tags (they live at different
+    // positions in AActor).
     static const int kOffsetInternal[] = { 0x44, 0x4C, 0x40, 0x48, 0x50, 0x54, 0x3C };
     int32_t bestOI = -1;
     for (int off : kOffsetInternal) {
@@ -3605,7 +4264,8 @@ bool discoverPropertyLayout() {
         break;
     }
 
-    // Stage E: probe FPROP_ELEMENT_SIZE - RootComponent=8, Tags=16.
+    // -- Stage E: probe FPROP_ELEMENT_SIZE --
+    // RootComponent is TObjectPtr (8 bytes), Tags is TArray<FName> (16 bytes).
     static const int kElementSize[] = { 0x34, 0x3C, 0x40, 0x38, 0x30, 0x44 };
     int32_t bestES = -1;
     for (int off : kElementSize) {
@@ -3626,19 +4286,31 @@ bool discoverPropertyLayout() {
         break;
     }
 
-    // Stage F: probe FPROP_FLAGS (uint64) - must have CPF_Edit, clear CPF_Parm, clear top byte.
-    // Diversity + richness checks rule out adjacent fields that read similarly across properties.
+    // -- Stage F: probe FPROP_FLAGS (uint64) --
+    // Strict validation: AActor's member properties (PrimaryActorTick, Tags,
+    // RootComponent) all carry CPF_Edit (bit 0). Parameters carry CPF_Parm
+    // (bit 7), and these are NOT parameters so CPF_Parm must be CLEAR.
+    // We also require the top 16 bits to be clear since real CPF_* defines
+    // fit comfortably below 2^48. A loose nonzero+top-byte-clear check is
+    // not enough - Palworld's FProperty has another uint64 a few bytes off
+    // that satisfies the loose check but isn't the flags field.
     static const int kFlags[] = { 0x38, 0x40, 0x30, 0x48, 0x44 };
     constexpr uint64_t CPF_Edit_local         = 0x0000000000000001ULL;
     constexpr uint64_t CPF_Parm_local         = 0x0000000000000080ULL;
     constexpr uint64_t CPF_NoClear_local      = 0x0000000000100000ULL;
     auto looksLikePropertyFlags = [&](uint64_t v) {
         if (v == 0 || v == ~0ULL) return false;
-        if ((v >> 56) != 0) return false;        // CPF_* fit in 56 bits
-        if (!(v & CPF_Edit_local)) return false; // member must have Edit bit
-        if (v & CPF_Parm_local) return false;    // not a parameter
+        // CPF_* defines extend up to ~bit 52 (CPF_HasGetValueTypeHash etc.),
+        // so only the top byte (bits 56-63) needs to be clear. Earlier I
+        // checked top 16 bits clear which incorrectly rejected real flag
+        // values with CPF_NativeAccessSpecifierPublic (bit 50) set.
+        if ((v >> 56) != 0) return false;
+        if (!(v & CPF_Edit_local)) return false; // member must have Edit/Visible bit
+        if (v & CPF_Parm_local) return false;    // member is NOT a parameter
         return true;
     };
+    // DIAGNOSTIC: dump every candidate FLAGS offset's value for all three
+    // anchors so we can see what's there and tune validation.
     Hydro::logInfo("EngineAPI: FLAGS candidate dump:");
     for (int off : kFlags) {
         uint64_t vTick = 0, vRoot = 0, vTags = 0;
@@ -3652,6 +4324,11 @@ bool discoverPropertyLayout() {
             tagsOk ? "0x" : "<r:", (unsigned long long)vTags);
     }
 
+    // Cross-validation across three anchor properties. Real PropertyFlags
+    // exhibit a rich, diverse bit pattern in the low 16 (multiple CPF bits
+    // per property) and differ between properties (since each property has
+    // its own CPF combination). Wrong offsets read pointers, hashes, or
+    // adjacent fields that share a sparse, uniform pattern across props.
     auto popcount16 = [](uint64_t v) {
         int n = 0;
         for (int b = 0; b < 16; b++) if (v & (1ULL << b)) n++;
@@ -3676,9 +4353,15 @@ bool discoverPropertyLayout() {
         }
         if (!ok) continue;
 
-        // Diversity and richness checks.
+        // Diversity: real PropertyFlags differ across properties. If any
+        // two anchors share a value at this offset, it's reading something
+        // not-property-specific (e.g. RepNotifyFunc=null packed similarly).
         if ((rootProp && vTick == vRoot) || (tagsProp && vTick == vTags) ||
             (rootProp && tagsProp && vRoot == vTags)) continue;
+
+        // Richness: properties typically carry several CPF bits in the low
+        // 16 (Edit, BlueprintVisible, BlueprintReadOnly, ReplicatedUsing,
+        // ReferenceParm, etc.). Wrong offsets show 1-2 bits at most.
         int richness = popcount16(vTick) + popcount16(vRoot) + popcount16(vTags);
         if (richness < 6) continue;
 
@@ -3714,10 +4397,26 @@ uint64_t getPropertyFlags(void* prop) {
     return flags;
 }
 
-// FNamePool direct reading - fastest name resolution path.
-// Reads directly from the engine's FNamePool block table using FNameEntry layout:
-//   Header (uint16): bit 0 = bIsWide, bits [6..15] = Len; followed by char/wchar_t Name[Len].
-// ComparisonIndex: Block = idx >> 16, EntryOffset = (idx & 0xFFFF) * 2.
+// -- FNamePool direct reading --
+// Fastest name resolution: reads directly from the engine's FNamePool
+// using pointer arithmetic. No function calls, no ProcessEvent.
+// Discovery: the FName constructor (already found) references the pool
+// via LEA instructions in its prologue. We resolve those, then validate
+// by checking that entry 0 reads as "None".
+// FNamePool layout (UE5):
+//   FNameEntryAllocator:
+//     +0x00: FRWLock Lock (8 bytes on Windows - SRWLOCK)
+//     +0x08: uint32 CurrentBlock
+//     +0x0C: uint32 CurrentByteCursor
+//     +0x10: uint8* Blocks[FNameMaxBlocks]  (pointers to memory blocks)
+// FNameEntry layout:
+//     +0x00: uint16 Header  (bit 0 = bIsWide, bits [6..15] = Len)
+//     +0x02: char/wchar_t Name[Len]
+// ComparisonIndex encoding:
+//     Block = idx >> FNameBlockOffsetBits  (typically 16)
+//     Offset = (idx & mask) * stride       (stride typically 2)
+
+// s_fnamePool and s_poolBlocksOffset declared early (near s_poolReady)
 
 // Try to validate a candidate pool address with a specific blocks offset.
 // Checks if entry at ComparisonIndex 0 is "None".
@@ -3804,8 +4503,9 @@ static std::string readFromPool(uint32_t comparisonIndex) {
 static bool discoverFNamePool() {
     static const int kBlocksOffsets[] = { 0x10, 0x18, 0x08, 0x20, 0x28, 0x30, 0x38, 0x40 };
 
-    // Strategy 1: walk the FName constructor's call tree (2 levels deep).
-    // The pool global is accessed via LEA or MOV [rip+disp] in a sub-function.
+    // -- Strategy 1: walk the FName constructor's call tree (2 levels deep) --
+    // The pool global is accessed via LEA or MOV [rip+disp] from a sub-function
+    // of the constructor (not from the constructor itself, which just hashes).
     if (s_fnameConstructor) {
         uint8_t* func = (uint8_t*)s_fnameConstructor;
 
@@ -3891,7 +4591,13 @@ static bool discoverFNamePool() {
         Hydro::logWarn("EngineAPI: FNamePool not found via call tree (%d funcs)", numTargets);
     }
 
-    // Strategy 2: data section scan for FNameEntryAllocator signature.
+    // -- Strategy 2: data section scan --
+    // The FNameEntryAllocator (embedded at offset 0 of FNamePool) has a distinctive layout:
+    //   +0x00: SRWLOCK (8 bytes, usually 0)
+    //   +0x08: CurrentBlock (uint32, typically 1-100)
+    //   +0x0C: CurrentByteCursor (uint32, 0..131072)
+    //   +0x10: Blocks[0] -> heap ptr -> FNameEntry starting with "None"
+    // Scan writable sections (same approach that found GUObjectArray).
     Hydro::logInfo("EngineAPI: FNamePool: trying data section scan...");
     {
         auto* dosHeader = (IMAGE_DOS_HEADER*)s_gm.base;
@@ -3933,7 +4639,9 @@ static bool discoverFNamePool() {
     return false;
 }
 
-// Conv_NameToString fallback - used only if FNamePool direct reading fails.
+// -- Conv_NameToString fallback --
+// Used only if FNamePool direct reading fails. Goes through ProcessEvent
+// which is much slower but always works.
 
 static void* s_kismetStringCDO = nullptr;
 static void* s_convNameToStringFunc = nullptr;
@@ -3988,22 +4696,29 @@ static bool discoverConvNameToString() {
 static std::string callConvNameToString(uint32_t comparisonIndex) {
     if (!s_kismetStringCDO || !s_convNameToStringFunc || !s_processEvent) return {};
 
-    if (comparisonIndex > 0x7FFFFFFF) return {}; // reject garbage pointer values
+    // Filter out values that are clearly garbage pointers, not FName indices.
+    // On x64, pointers have high bits set (> 0x7FFFFFFF). Valid FName indices
+    // can be large but fit in the lower 31 bits.
+    if (comparisonIndex > 0x7FFFFFFF) return {};
 
     uint16_t parmsSize = getUFunctionParmsSize(s_convNameToStringFunc);
     uint16_t retOff    = getUFunctionRetOffset(s_convNameToStringFunc);
 
     if (parmsSize > 256 || parmsSize == 0) return {};
 
+    // Build params buffer: FName input at offset 0, FString output at retOff.
+    // Must be 16-byte aligned - ProcessEvent uses SSE/AVX instructions.
     alignas(16) uint8_t params[256] = {};
-    memcpy(params, &comparisonIndex, 4); // FName = { ComparisonIndex, Number }
+    // FName = { ComparisonIndex: uint32, Number: uint32 }
+    memcpy(params, &comparisonIndex, 4);
     uint32_t number = 0;
     memcpy(params + 4, &number, 4);
 
     bool ok = callProcessEvent(s_kismetStringCDO, s_convNameToStringFunc, params);
     if (!ok) return {};
 
-    // Read FString (TCHAR* Data, int32 ArrayNum, int32 ArrayMax) from retOff.
+    // Read FString from params at retOff.
+    // FString = { TCHAR* Data, int32 ArrayNum, int32 ArrayMax }
     void* data = nullptr;
     int32_t arrayNum = 0;
     memcpy(&data, params + retOff, sizeof(void*));
@@ -4011,7 +4726,9 @@ static std::string callConvNameToString(uint32_t comparisonIndex) {
 
     if (!data || arrayNum <= 0) return {};
 
-    int32_t len = arrayNum - 1; // arrayNum includes null terminator
+    // Data points to a wchar_t string (UE5 TCHAR = wchar_t on Windows)
+    // Convert to narrow string. arrayNum includes null terminator.
+    int32_t len = arrayNum - 1;
     if (len <= 0 || len > 1024) return {};
 
     std::string result;
@@ -4021,7 +4738,11 @@ static std::string callConvNameToString(uint32_t comparisonIndex) {
         result += (char)(wdata[i] & 0x7F);
     }
 
-    // FString Data is GMalloc-owned; not freed here (leak bounded by cache).
+    // Note: FString Data is allocated by the engine's GMalloc. We don't
+    // free it here - the leak is bounded by the cache (each index resolved
+    // once). Total leak is ~20KB for a typical game with ~1000 unique names
+    // accessed during a Reflect session.
+
     return result;
 }
 
@@ -4060,7 +4781,10 @@ std::string getObjectName(void* obj) {
     return getNameString(getNameIndex(obj));
 }
 
-// FField name offset: discovered once at first call via PrimaryActorTick probe.
+// FField name offset: discovered once at first call by using findProperty
+// with a known property name and checking which offset produces the
+// matching FName index. Same "validate against a known invariant" approach
+// as FFrame::Node probing and BeginPlay vtable discovery.
 static int s_ffieldNameOffset = -1;
 
 static void discoverFieldNameOffset() {
@@ -4073,6 +4797,7 @@ static void discoverFieldNameOffset() {
     void* prop = findProperty(actorClass, L"PrimaryActorTick");
     if (!prop) return;
 
+    // Probe candidate offsets on the known-valid FProperty
     static const int kOffsets[] = { 0x20, 0x28, 0x18, 0x30, 0x38 };
     for (int off : kOffsets) {
         uint32_t idx = 0;
@@ -4097,7 +4822,9 @@ std::string getFieldName(void* field) {
     return getNameString(idx);
 }
 
-// SuperStruct offset: probes until a candidate dereferences to name "Object".
+// SuperStruct offset discovery. AActor's SuperStruct is the UClass for
+// "Object" in most UE5 builds; we probe a few known layout offsets until
+// one dereferences to a struct named "Object".
 static void discoverSuperOffset() {
     void* actorClass = findObject(L"/Script/Engine.Actor");
     if (!actorClass) { s_superOffset = 0x40; return; }
@@ -4105,6 +4832,7 @@ static void discoverSuperOffset() {
     uint32_t objectIdx = makeFName(L"Object");
     if (objectIdx == 0) { s_superOffset = 0x40; return; }
 
+    // Probe offsets in the UStruct region (after UField/UObject base, before Children)
     static const int kOffsets[] = { 0x40, 0x48, 0x38, 0x50, 0x30, 0x58 };
     for (int off : kOffsets) {
         void* candidate = nullptr;
@@ -4130,15 +4858,24 @@ void* getSuper(void* ustruct) {
     return super;
 }
 
-// Layer 3: UFunction parameter layout from the property chain.
-// ParmsSize = max(offset + elementSize), ReturnValueOffset = CPF_ReturnParm property's offset.
-// UFUNC_PARMS_SIZE / UFUNC_RET_VAL_OFFSET constants are bootstrap fallbacks only.
+// -- Layer 3: UFunction parameter layout derived from the property chain --
+// UFunction::ParmsSize and UFunction::ReturnValueOffset aren't really
+// independent fields - they're already encoded by the parameter FProperty
+// chain. Walking the chain (which uses Layer 2's discovered FProperty
+// offsets) gives us:
+//   ParmsSize         = max(prop->Offset_Internal + prop->ElementSize)
+//   ReturnValueOffset = (the FProperty with CPF_ReturnParm set)->Offset_Internal
+// This eliminates UFUNC_PARMS_SIZE / UFUNC_RET_VAL_OFFSET as load-bearing
+// constants - they're now bootstrap fallbacks only. Per-UFunction cache
+// avoids re-walking on every call (HydroCore calls each UFunction many
+// times). Cache is bounded by the small number of UFunctions HydroCore
+// touches; memory is trivial.
 
 struct UFuncLayoutCache {
     uint16_t parmsSize;
     uint16_t retOffset;
     bool     hasReturn;
-    bool     derived;     // true = from chain, false = raw fallback read
+    bool     derived;     // true = computed from chain, false = fallback raw read
 };
 static std::unordered_map<void*, UFuncLayoutCache> s_ufuncLayouts;
 
@@ -4148,6 +4885,10 @@ static UFuncLayoutCache computeUFunctionLayout(void* ufunc) {
     UFuncLayoutCache out = {0, 0, false, false};
     if (!ufunc) return out;
 
+    // DIAGNOSTIC: dump UFunction slot layout to find where its property chain
+    // actually lives. Our Layer 2 probe found USTRUCT_CHILD_PROPS=0x50 against
+    // AActor's UClass - but UFunction may store its parameter chain at a
+    // different offset on forked engines.
     Hydro::logInfo("EngineAPI: UFunction %p slot dump:", ufunc);
     for (int off = 0x40; off <= 0xE0; off += 8) {
         void* p = nullptr;
@@ -4161,10 +4902,17 @@ static UFuncLayoutCache computeUFunctionLayout(void* ufunc) {
                        inMod ? " <module>" : (heapLike ? " <heap>" : ""));
     }
 
+    // Use discovered chain-walk offsets so this works on hosts where the
+    // UStruct/FField layout has shifted (e.g. Palworld's UE 5.1.x fork).
     void* prop = getChildProperties(ufunc);
 
     Hydro::logInfo("EngineAPI: computeUFunctionLayout %p chain (firstProp=%p):", ufunc, prop);
 
+    // DIAGNOSTIC: dump the FIRST FProperty's bytes from offset 0x00 to 0x60.
+    // We need to see whether it's an FField (vtable + ClassPrivate + Owner +
+    // Next + NamePrivate) or a UField-derived UProperty (UObject base then
+    // Next at +0x28). The Next offset on UFunction's param chain may differ
+    // from what we discovered against AActor's UClass chain.
     if (prop) {
         Hydro::logInfo("EngineAPI: first FProperty %p slot dump:", prop);
         for (int off = 0x00; off <= 0x60; off += 8) {
@@ -4195,6 +4943,8 @@ static UFuncLayoutCache computeUFunctionLayout(void* ufunc) {
                        (pflags & CPF_OutParm) ? "Out " : "",
                        (pflags & CPF_ReturnParm) ? "Return " : "");
 
+        // Only properties on the UFunction's chain are parameters (incl. return).
+        // Defensive: skip clearly-bogus values rather than poison the result.
         if (off >= 0 && off < 4096 && sz > 0 && sz < 1024) {
             uint32_t end = (uint32_t)off + (uint32_t)sz;
             if (end > out.parmsSize && end < 4096)
@@ -4221,7 +4971,10 @@ static UFuncLayoutCache getUFuncLayoutCached(void* ufunc) {
 
     UFuncLayoutCache layout = computeUFunctionLayout(ufunc);
 
-    // Fallback to raw hardcoded offsets if chain walk yielded nothing.
+    // Fallback: if the chain walk yielded nothing (e.g. native UFunction with
+    // no reflected parameters, or Layer 2 not yet up), fall back to the raw
+    // hardcoded offsets. Better wrong than zero - avoids silent ProcessEvent
+    // failures on bootstrap.
     if (!layout.derived) {
         uint16_t ps = 0, ro = 0;
 #ifdef _WIN32
@@ -4239,6 +4992,8 @@ static UFuncLayoutCache getUFuncLayoutCached(void* ufunc) {
     return layout;
 }
 
+// UFunction metadata readers - derive from the parameter property chain.
+// First call per UFunction walks the chain; subsequent calls hit the cache.
 uint16_t getUFunctionParmsSize(void* ufunc) {
     if (!ufunc) return 0;
     return getUFuncLayoutCached(ufunc).parmsSize;
@@ -4249,8 +5004,13 @@ uint16_t getUFunctionRetOffset(void* ufunc) {
     return getUFuncLayoutCached(ufunc).retOffset;
 }
 
-// Layer 4: per-class named property offset cache.
-// Replaces hardcoded class-level offsets (e.g., AActor::RootComponent at +0x198).
+// -- Layer 4: per-class named property offset cache ---
+// findReflectedFieldOffset(uclassPtr, "RootComponent") returns the byte
+// offset of that field within instances of `uclassPtr` - discovered once
+// via the property chain (which uses Layer 2's offsets), then cached.
+// This replaces hardcoded class-level offsets like AActor::RootComponent
+// at +0x198. Tier 2 modules can use this directly to read fields without
+// committing to per-engine-version constants.
 struct FieldOffsetKey {
     void* uclass;
     std::wstring fieldName;
@@ -4286,22 +5046,30 @@ uint32_t getUFunctionFlags(void* ufunc) {
     return val;
 }
 
-// UClass::ClassFlags offset: discovered once via /Script/CoreUObject.Object (must have CLASS_Native set).
+// UClass::ClassFlags offset: discovered once at first call.
+// /Script/CoreUObject.Object always has CLASS_Native (0x00000001) set, plus
+// CLASS_RequiredAPI (0x00000200) is a strong additional hint. Probe offsets
+// until we find one where both flags are set on UObject.
 static int s_classFlagsOffset = -1;
 
 static void discoverClassFlagsOffset() {
     void* uobjectClass = findObject(L"/Script/CoreUObject.Object");
     if (!uobjectClass) { s_classFlagsOffset = 0x1C0; return; }
 
+    // Probe common UE5 offsets for UClass::ClassFlags.
     static const int kOffsets[] = {
         0x1C0, 0x1B0, 0x1C8, 0x1D0, 0x1B8, 0x1A8, 0x1E0, 0x1E8, 0x1F0, 0x1F8, 0x200
     };
     for (int off : kOffsets) {
         uint32_t flags = 0;
         if (!safeReadInt32((uint8_t*)uobjectClass + off, (int32_t*)&flags)) continue;
-        if ((flags & 0x1) == 0) continue;         // must have CLASS_Native
+        // UObject must have CLASS_Native (0x1) set.
+        // Also, the upper half shouldn't be 0xFFFFFFFF or clearly garbage.
+        if ((flags & 0x1) == 0) continue;
         if (flags == 0xFFFFFFFF || flags == 0) continue;
-        if (flags > 0x10000000) continue;          // CLASS_* fit in 28 bits
+        // UObject has ~CLASS_Native|CLASS_MatchedSerializers|CLASS_RequiredAPI at minimum.
+        // Accept if flags has CLASS_Native and is plausibly small.
+        if (flags > 0x10000000) continue; // CLASS_* flags fit in 28 bits typically
         s_classFlagsOffset = off;
         Hydro::logInfo("EngineAPI: UClass::ClassFlags offset = 0x%X (validated via Object, flags=0x%X)", off, flags);
         return;
@@ -4319,7 +5087,13 @@ uint32_t getClassFlags(void* cls) {
     return val;
 }
 
-// UEnum::Names offset: discovered by probing for TArray<TPair<FName, int64>> (16B stride).
+// UEnum::Names offset: discovered on first call by probing candidate
+// offsets for a TArray<TPair<FName, int64>> that decodes sanely.
+// TArray layout in UE5 is: T* Data (8) + int32 Num (4) + int32 Max (4) = 16B
+// Each TPair<FName, int64> is: FName (8 = ComparisonIdx + Number) + int64 (8) = 16B
+// Validation: Num must be small (1..10000), Max >= Num, Data is a heap
+// pointer (not null, not in module), and the first entry's ComparisonIndex
+// must resolve to a non-empty FName via FNamePool.
 static int s_enumNamesOffset = -1;
 
 static void discoverEnumNamesOffset() {
@@ -4344,10 +5118,12 @@ static void discoverEnumNamesOffset() {
         return;
     }
 
+    // Probe offsets common in UE5: after UObject header + a few UField bits.
     static const int kOffsets[] = { 0x40, 0x48, 0x50, 0x58, 0x38, 0x60, 0x68 };
     for (int off : kOffsets) {
         void* data = nullptr;
         if (!safeReadPtr((uint8_t*)enumProbe + off, &data) || !data) continue;
+        // Data must be heap (not in module)
         if ((uint8_t*)data >= s_gm.base && (uint8_t*)data < s_gm.base + s_gm.size) continue;
 
         int32_t num = 0, max = 0;
@@ -4356,6 +5132,7 @@ static void discoverEnumNamesOffset() {
         if (num < 1 || num > 10000) continue;
         if (max < num) continue;
 
+        // Validate the first entry: TPair<FName, int64> at Data[0]
         uint32_t firstComparisonIdx = 0;
         if (!safeReadInt32(data, (int32_t*)&firstComparisonIdx)) continue;
         if (firstComparisonIdx == 0) continue;
@@ -4399,7 +5176,8 @@ int readEnumNames(void* uenum, std::vector<std::pair<uint32_t, int64_t>>& out) {
     return (int)out.size();
 }
 
-// OuterPrivate offset: discovered once via AActor (outer should name "Engine").
+// OuterPrivate offset: discovered once at first call by probing known objects.
+// AActor's outer is the /Script/Engine package (FName = "Engine").
 static int s_outerOffset = -1;
 
 static void discoverOuterOffset() {
@@ -4412,6 +5190,7 @@ static void discoverOuterOffset() {
         return;
     }
 
+    // Probe offsets and log what's at each one
     static const int kOffsets[] = { 0x20, 0x28, 0x30, 0x18, 0x38, 0x40, 0x48 };
     Hydro::logInfo("EngineAPI: OuterPrivate probe on AActor at %p:", actorClass);
     for (int off : kOffsets) {
@@ -4426,6 +5205,7 @@ static void discoverOuterOffset() {
         Hydro::logInfo("  +0x%02X: %p nameIdx=%u name='%s'", off, candidate, idx, name.c_str());
     }
 
+    // Use 0x20 (confirmed by UE4SS) and log the result
     void* outer = nullptr;
     readPtr((uint8_t*)actorClass + UOBJ_OUTER, &outer);
     if (outer) {
@@ -4446,7 +5226,8 @@ void* getOuter(void* obj) {
 std::string getObjectPath(void* obj) {
     if (!obj) return {};
 
-    // Walk the Outer chain, then reconstruct UE's GetPathName separator rules.
+    // Walk the Outer chain capturing (name, isPackage) per level.
+    // isPackage = the object's UClass FName == "Package".
     struct Level { std::string name; bool isPackage; };
     std::vector<Level> levels;
     void* cur = obj;
@@ -4463,8 +5244,16 @@ std::string getObjectPath(void* obj) {
     }
     if (levels.empty()) return {};
 
-    // Separator: ':' when parent is non-package and grandparent is package
-    // (SUBOBJECT_DELIMITER); '.' otherwise.
+    // Build path mirroring UE's UObject::GetPathName (UObject.cpp:530-561):
+    //   - Outermost name is emitted verbatim (UPackage names already start
+    //     with '/', e.g. "/Script/AssetRegistry"; other top-level names are
+    //     emitted as-is).
+    //   - Separator between parent and child:
+    //       ':'  when parent is non-package AND grandparent is a package
+    //              (the SUBOBJECT_DELIMITER case)
+    //       '.'  otherwise (the common case)
+    //   - Never use '/' between non-package outers.
+    // levels[size-1] = outermost, levels[0] = innermost (obj itself).
     int last = (int)levels.size() - 1;
     std::string path = levels[last].name;
     for (int i = last - 1; i >= 0; i--) {
@@ -4479,12 +5268,29 @@ std::string getObjectPath(void* obj) {
 }
 
 
-// FShaderCodeLibrary::OpenLibrary discovery via "FShaderCodeLibrary::OpenLibrary"
-// string xref + .pdata-based containing-function lookup.
+// -- FShaderCodeLibrary::OpenLibrary discovery --
+// UE doesn't auto-mount shader archives from runtime-mounted paks. Without
+// an explicit `FShaderCodeLibrary::OpenLibrary(name, dir)` call after pak
+// mount, materials in the mod pak will load but render as default (missing
+// material) because their shader maps can't bind to the unregistered
+// archive.
+// Discovery is the same string-xref + walk-back-to-prologue pattern used
+// for StaticFindObjectFast, FName ctor, etc. UE bakes the function's own
+// name as a wide-string literal in the binary (used by UE_LOG macros) -
+// `"FShaderCodeLibrary::OpenLibrary"` appears verbatim. We find LEA refs
+// to that string in `.text`, walk back to the function prologue.
+// Validation: resilient on this build because there's exactly ONE LEA ref
+// to the string in the entire `.text` section (verified empirically) - no
+// ambiguity. If multiple refs ever surface in a future engine version,
+// extend this with a Tier 2 (caller-side xref via `InitForRuntime` string).
 
 static bool findOpenShaderLibrary() {
     if (!s_gm.base) return false;
 
+    // Tier 1: locate the FShaderCodeLibrary::OpenLibrary literal string.
+    // UE emits this via __FUNCTION__/__PRETTY_FUNCTION__ macros - stored as
+    // ASCII, NOT UTF-16. (Wide strings come from UE_LOG TEXT() macros; the
+    // function-name literal stays char* because that's what __FUNCTION__ is.)
     const char* needle = "FShaderCodeLibrary::OpenLibrary";
     size_t needleLen = strlen(needle);
     uint8_t* strAddr = nullptr;
@@ -4501,6 +5307,8 @@ static bool findOpenShaderLibrary() {
     Hydro::logInfo("EngineAPI: 'FShaderCodeLibrary::OpenLibrary' string at exe+0x%zX",
         (size_t)(strAddr - s_gm.base));
 
+    // Find LEA(s) to this string in the binary's code. Single-tier: one
+    // anchor, walk back to the enclosing function's prologue.
     uint8_t* leaAddr = findLeaRef(s_gm.base, s_gm.size, strAddr);
     if (!leaAddr) {
         Hydro::logWarn("EngineAPI: No LEA ref to OpenLibrary string");
@@ -4508,8 +5316,15 @@ static bool findOpenShaderLibrary() {
     }
     Hydro::logInfo("EngineAPI: LEA at exe+0x%zX", (size_t)(leaAddr - s_gm.base));
 
-    // Locate enclosing function via .pdata (binary search on sorted RUNTIME_FUNCTION table).
-    // More reliable than prologue-pattern walk-back, which overshoots on SSE-prologue functions.
+    // Resilient containing-function lookup via the PE's exception directory
+    // (.pdata). Every x64 PE binary has .pdata listing every function's
+    // [BeginRVA, EndRVA) - sorted by BeginRVA. Far more reliable than the
+    // prior heuristic of walking back for known prologue byte patterns,
+    // which fell over on functions whose first instruction is `movaps
+    // [rsp+disp32], xmmN` (SSE register save) - common in heavy renderer
+    // code like FShaderLibrariesCollection::OpenLibrary, but missing from
+    // the prologue whitelist so the walker overshot into a sibling
+    // function (`FEngineLoop::PreInitPostStartupScreen` empirically).
     auto* dosHeader = (IMAGE_DOS_HEADER*)s_gm.base;
     auto* ntHeaders = (IMAGE_NT_HEADERS*)(s_gm.base + dosHeader->e_lfanew);
     auto& excDir = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
@@ -4521,6 +5336,8 @@ static bool findOpenShaderLibrary() {
     size_t numFuncs = excDir.Size / sizeof(RUNTIME_FUNCTION);
     uint32_t leaRva = (uint32_t)(leaAddr - s_gm.base);
 
+    // Binary search: .pdata is sorted by BeginAddress. Find the entry where
+    // BeginAddress <= leaRva < EndAddress.
     size_t lo = 0, hi = numFuncs;
     while (lo < hi) {
         size_t mid = (lo + hi) / 2;
@@ -4544,15 +5361,23 @@ static bool findOpenShaderLibrary() {
     return false;
 }
 
-// FString layout: TCHAR* Data, int32 ArrayNum (including null), int32 ArrayMax.
+// FString layout in UE 5.5 (16 bytes):
+//   +0x00: TCHAR* Data           - wide-string buffer (null-terminated)
+//   +0x08: int32  ArrayNum       - character count INCLUDING null terminator
+//   +0x0C: int32  ArrayMax       - capacity (>= ArrayNum)
 struct FStringMinimal {
     wchar_t* Data;
     int32_t ArrayNum;
     int32_t ArrayMax;
 };
 
-// GMalloc: obtained via patternsleuth. FString Data buffers passed to OpenLibrary
-// must be GMalloc-owned or UE crashes when it tries to FMemory::Free them.
+// -- GMalloc discovery via patternsleuth --
+// FShaderCodeLibrary::OpenLibrary takes its first FString arg by value, which
+// means its Data buffer must be allocatable/freeable by UE's allocator
+// (FMemory -> GMalloc). Pointing Data at .rdata or WinAPI-heap memory crashes
+// when UE re-allocates the FString.
+// We get GMalloc's address via patternsleuth (already linked via UE4SS) - it
+// has a built-in resolver. Then GMalloc->vtable[2] is `Malloc(size, align)`.
 struct PsScanConfig {
     bool guobject_array{}; bool fname_tostring{}; bool fname_ctor_wchar{};
     bool gmalloc{};
@@ -4594,7 +5419,9 @@ static bool findGMalloc() {
         Hydro::logWarn("EngineAPI: ps_scan didn't return GMalloc");
         return false;
     }
-    void** gmallocPtr = (void**)results.gmalloc; // patternsleuth gives the variable, dereference for instance
+    // results.gmalloc is the address of the GMalloc *variable* (a FMalloc**).
+    // Dereference once to get the actual FMalloc* instance pointer.
+    void** gmallocPtr = (void**)results.gmalloc;
     void* gmallocInstance = nullptr;
     if (!safeReadPtr(gmallocPtr, &gmallocInstance) || !gmallocInstance) {
         Hydro::logWarn("EngineAPI: GMalloc variable at %p has null instance", results.gmalloc);
@@ -4606,7 +5433,10 @@ static bool findGMalloc() {
     return true;
 }
 
-// FMalloc::Malloc vtable index: probe rather than hardcode (slot shifts between dev/shipping).
+// FMalloc::Malloc(SIZE_T Size, uint32 Alignment).
+// Vtable index varies - FMalloc inherits from FExec so [0]=dtor, then a few
+// FExec virtuals (Exec deprecated, Exec_Internal), THEN Malloc. Empirically
+// often [3] in UE 5.5, but probe to handle drift.
 using FMallocFn = void*(__fastcall*)(void* self, size_t size, uint32_t align);
 
 static int s_mallocVtableIdx = -1;  // cached after first probe
@@ -4618,7 +5448,24 @@ static void* gmallocAlloc(size_t size, uint32_t align = 8) {
     void** vtable = nullptr;
     if (!safeReadPtr(s_gmalloc, (void**)&vtable) || !vtable) return nullptr;
 
+    // Probe slots 2..7 to find Malloc. Per UE 5.5 source (verified
+    // against MemoryBase.h + Exec.h), shipping builds have:
+    //   vtable[0]  ~FMalloc dtor
+    //   vtable[1..5] FExec virtuals (Exec, Exec_Runtime, Exec_Dev, Exec_Editor)
+    //   vtable[6]  Malloc(SIZE_T, uint32)        <- what we want
+    //   vtable[7]  TryMalloc
+    //   vtable[8]  Realloc
+    //   vtable[9]  TryRealloc
+    //   vtable[10] Free
+    //   vtable[26] GetDescriptiveName            <- sanity check anchor
+    // Dev/editor builds shift each FMalloc index down by one (FExec one
+    // shorter). Probing rather than hardcoding survives both build flavors
+    // and modest UE-version drift.
     if (s_mallocVtableIdx < 0) {
+        // Widen probe to 2..15 - Palworld's FMalloc vtable shifts the
+        // Malloc slot outside the stock-UE range (5..7). The writability
+        // check still rejects non-Malloc slots, so widening doesn't risk
+        // false positives.
         for (int idx = 2; idx <= 15; idx++) {
             auto candidate = (FMallocFn)vtable[idx];
             if (!candidate) continue;
@@ -4647,7 +5494,9 @@ static void* gmallocAlloc(size_t size, uint32_t align = 8) {
             s_mallocVtableIdx = idx;
             Hydro::logInfo("EngineAPI: GMalloc::Malloc probed at vtable[%d] (test alloc=%p, writable)",
                 idx, result);
-            break; // test alloc not freed (haven't probed Free yet); 16-byte leak acceptable
+            // Don't free the 16-byte test alloc - we haven't probed Free.
+            // Permanently leaks 16 bytes. Acceptable.
+            break;
         }
         if (s_mallocVtableIdx < 0) {
             Hydro::logWarn("EngineAPI: Failed to probe FMalloc::Malloc in vtable[2..7]");
@@ -4666,7 +5515,8 @@ static void* gmallocAlloc(size_t size, uint32_t align = 8) {
     return p;
 }
 
-// Allocate and populate an FString via GMalloc (required for OpenLibrary callers).
+// Allocate + populate an FString from a wide string. Buffer is GMalloc-owned
+// so OpenLibrary's FMemory::Free won't crash.
 static bool buildFString(FStringMinimal& out, const wchar_t* src) {
     int len = (int)wcslen(src) + 1;  // include null terminator
     void* buf = gmallocAlloc(len * sizeof(wchar_t), 8);
@@ -4683,6 +5533,9 @@ void* getOpenShaderLibraryFn() { return s_openShaderLibrary; }
 bool openShaderLibrary(const wchar_t* libraryName, const wchar_t* mountDir) {
     if (!s_openShaderLibrary || !libraryName || !mountDir) return false;
 
+    // Allocate FString buffers via GMalloc so UE's FMemory machinery can
+    // own them. Pointing Data at .rdata or WinAPI heap caused crashes
+    // (UE tried to FMemory::Free our buffers, mismatched allocator).
     FStringMinimal libString = {};
     FStringMinimal dirString = {};
     if (!buildFString(libString, libraryName) || !buildFString(dirString, mountDir)) {
@@ -4693,8 +5546,19 @@ bool openShaderLibrary(const wchar_t* libraryName, const wchar_t* mountDir) {
     Hydro::logInfo("EngineAPI: OpenShaderLibrary(name='%ls' @ %p, dir='%ls' @ %p)",
         libraryName, libString.Data, mountDir, dirString.Data);
 
-    // Signature: bool OpenLibrary(FString const& Name, FString const& Directory, bool bMonolithicOnly).
-    // bMonolithicOnly must be explicit (r8b); garbage register caused monolithic-only crashes.
+    // UE 5.5 signature (verified from `Engine/Source/Runtime/RenderCore/
+    // Public/ShaderCodeLibrary.h`):
+    //   static RENDERCORE_API bool OpenLibrary(
+    //       FString const& Name,
+    //       FString const& Directory,
+    //       bool bMonolithicOnly = false);
+    // 3 args, both FStrings by const-ref. Calling convention:
+    //   rcx = &Name (FString*)
+    //   rdx = &Directory (FString*)
+    //   r8b = bMonolithicOnly (zero-extended bool)
+    // Earlier 2-arg attempts left r8 with garbage register state - likely
+    // the crash trigger as the function read it as bool but interpreted
+    // a wide value as truthy, sending it down the monolithic-only path.
     using OpenLibraryFn = bool(__fastcall*)(FStringMinimal*, FStringMinimal*, bool);
     auto fn = (OpenLibraryFn)s_openShaderLibrary;
 
@@ -4713,8 +5577,20 @@ bool openShaderLibrary(const wchar_t* libraryName, const wchar_t* mountDir) {
     return ok;
 }
 
-// AssetRegistry::ScanPathsSynchronous via reflected UFUNCTION (ProcessEvent).
-// Param layout: TArray<FString> at +0x00 (16B), bForceRescan at +0x10, bIgnoreDenyListScanFilters at +0x11.
+// -- AssetRegistry::ScanPathsSynchronous via reflection ---
+// UE only auto-indexes paks discovered at engine startup. A pak mounted
+// later is invisible to AssetRegistry until we explicitly request a scan.
+// IAssetRegistry::ScanPathsSynchronous is reflected (UFUNCTION-decorated),
+// so we can call it via ProcessEvent without depending on any pattern-
+// scanned native function - the path used for everything Layer-3-and-up.
+// Signature (UE 5.x):
+//   virtual void ScanPathsSynchronous(const TArray<FString>& InPaths,
+//                                     bool bForceRescan = false,
+//                                     bool bIgnoreDenyListScanFilters = false) const;
+// Param layout (derived per-host via getUFunctionParmsSize/RetOffset):
+//   +0x00: TArray<FString> InPaths   (Data ptr + Num + Max = 16 bytes)
+//   +0x10: bool bForceRescan
+//   +0x11: bool bIgnoreDenyListScanFilters
 
 bool scanAssetRegistryPaths(const wchar_t* virtualPath, bool forceRescan) {
     if (!s_processEvent || !virtualPath) return false;
@@ -4723,7 +5599,10 @@ bool scanAssetRegistryPaths(const wchar_t* virtualPath, bool forceRescan) {
         return false;
     }
 
-    // Interface class via K2_GetAssetByObjectPath's outer (Palworld: no UFunctions on impl class).
+    // The implementing class has no reflected UFunctions on Palworld.
+    // The functions live on the abstract interface UClass; we get to it via
+    // any known UFunction's outer (most reliable: we already discovered
+    // K2_GetAssetByObjectPath whose outer IS the interface class).
     void* arInterfaceClass = nullptr;
     if (s_getByPathFunc) {
         arInterfaceClass = getOuter(s_getByPathFunc);
@@ -4736,6 +5615,9 @@ bool scanAssetRegistryPaths(const wchar_t* virtualPath, bool forceRescan) {
     Hydro::logInfo("EngineAPI: scanAssetRegistryPaths - impl=%p implClass=%p interfaceClass=%p",
                    s_assetRegImpl, arImplClass, arInterfaceClass);
 
+    // Diagnostic: dump every UFunction on the interface class so we can see
+    // what loading primitives are exposed (e.g., GetAssetWithLoad,
+    // SearchAllAssets, etc.) - not just the scan family.
     if (arInterfaceClass) {
         Hydro::logInfo("EngineAPI: AR interface class UFunctions:");
         void* child = nullptr;
@@ -4752,6 +5634,8 @@ bool scanAssetRegistryPaths(const wchar_t* virtualPath, bool forceRescan) {
             n++;
         }
     }
+    // Also dump AssetRegistryHelpers static functions - UE often wraps
+    // helpers there for things not directly on the interface.
     if (s_assetRegHelpersCDO) {
         void* helpersClass = getClass(s_assetRegHelpersCDO);
         Hydro::logInfo("EngineAPI: AR helpers class UFunctions:");
@@ -4769,6 +5653,7 @@ bool scanAssetRegistryPaths(const wchar_t* virtualPath, bool forceRescan) {
         }
     }
 
+    // Try EACH class with EVERY name variant to maximize discovery.
     void* arClass = arInterfaceClass ? arInterfaceClass : arImplClass;
     void* scanFn = nullptr;
     static const wchar_t* kNames[] = {
@@ -4790,6 +5675,8 @@ bool scanAssetRegistryPaths(const wchar_t* virtualPath, bool forceRescan) {
             if (scanFn) { Hydro::logInfo("EngineAPI:   found %ls on impl class", name); break; }
         }
     }
+    // Also try direct path lookup as a last-ditch resort (works if the
+    // function is in GUObjectArray under a known full path).
     if (!scanFn) scanFn = findObject(L"/Script/AssetRegistry.AssetRegistry:ScanPathsSynchronous");
     if (!scanFn) scanFn = findObject(L"/Script/AssetRegistry.AssetRegistryImpl:ScanPathsSynchronous");
     if (!scanFn) scanFn = findObject(L"/Script/AssetRegistry.AssetRegistryHelpers:ScanPathsSynchronous");
@@ -4826,12 +5713,18 @@ bool scanAssetRegistryPaths(const wchar_t* virtualPath, bool forceRescan) {
     }
     Hydro::logInfo("EngineAPI: scanAssetRegistryPaths - found scan UFunction at %p", scanFn);
 
+    // Allocate the path FString via GMalloc so the function can read it
+    // safely. Don't free - UE's TArray destructor would handle this if it
+    // takes ownership; if not, ~16 bytes per scan is acceptable leak.
     FStringMinimal pathStr = {};
     if (!buildFString(pathStr, virtualPath)) {
         Hydro::logWarn("EngineAPI: scanAssetRegistryPaths - failed to allocate FString");
         return false;
     }
 
+    // Allocate the TArray's element buffer via GMalloc too. UE TArray<FString>
+    // is contiguous: { FString[Num] }, no individual heap per element from
+    // outside-the-buffer's perspective.
     void* arrayBuf = gmallocAlloc(sizeof(FStringMinimal), 8);
     if (!arrayBuf) {
         Hydro::logWarn("EngineAPI: scanAssetRegistryPaths - failed to allocate TArray buffer");
@@ -4855,9 +5748,14 @@ bool scanAssetRegistryPaths(const wchar_t* virtualPath, bool forceRescan) {
     alignas(16) uint8_t params[256] = {};
     memcpy(params + 0x00, &pathArray, sizeof(pathArray));    // TArray<FString>
     *(bool*)(params + 0x10) = forceRescan;                   // bForceRescan
-    *(bool*)(params + 0x11) = false;                          // bIgnoreDenyListScanFilters
+    // DIAGNOSTIC 2026-04-28: flip to true. Tests whether Palworld AR has a
+    // deny-list filter blocking /Game/Mods/. If this changes ScanPathsSynchronous
+    // behavior (i.e. the scan suddenly indexes our pak content), we found the
+    // simplest possible fix: one-byte default. If no change, the bug is upstream
+    // (mount point never registered with FPackageName).
+    *(bool*)(params + 0x11) = true;                           // bIgnoreDenyListScanFilters (was false)
 
-    Hydro::logInfo("EngineAPI: ScanPathsSynchronous('%ls', forceRescan=%d) ParmsSize=%u",
+    Hydro::logInfo("EngineAPI: ScanPathsSynchronous('%ls', forceRescan=%d, bIgnoreDenyList=true) - ParmsSize=%u",
                    virtualPath, forceRescan ? 1 : 0, parmsSize);
 
     bool ok = callFunction(s_assetRegImpl, scanFn, params);
@@ -4865,8 +5763,20 @@ bool scanAssetRegistryPaths(const wchar_t* virtualPath, bool forceRescan) {
     return ok;
 }
 
-// AssetRegistry::ScanFilesSynchronous - takes a filesystem .uasset path.
-// Param layout: TArray<FString> at +0x00, bool bForceRescan at +0x10.
+// -- AssetRegistry::ScanFilesSynchronous via reflection ---
+// Sibling of scanAssetRegistryPaths but takes a filesystem .uasset path
+// instead of a virtual /Game/ path. Reason: on Palworld, ScanPathsSynchronous
+// drops our path during FPackageName::TryConvertLongPackageNameToFilename
+// because the runtime-mounted pak's mount point was never registered with
+// FPackageName (the broadcast that should have called RegisterMountPoint
+// during pak mount didn't fire). ScanFilesSynchronous's filesystem-direction
+// lookup may bypass that broken step entirely - UE 5.1 reads the .uasset's
+// own header to extract the package name, so it doesn't need the mount tree.
+// Signature (UE 5.1):
+//   virtual void ScanFilesSynchronous(const TArray<FString>& Files,
+//                                     bool bForceRescan = false) const;
+// Param layout: same TArray<FString> at +0x00, single bool at +0x10.
+// (No bIgnoreDenyListScanFilters - that was ScanPaths-only.)
 
 bool scanAssetRegistryFiles(const wchar_t* uassetFilename, bool forceRescan) {
     if (!s_processEvent || !uassetFilename) return false;
@@ -4875,11 +5785,16 @@ bool scanAssetRegistryFiles(const wchar_t* uassetFilename, bool forceRescan) {
         return false;
     }
 
+    // Resolve interface class (where ScanFilesSynchronous lives, same as
+    // ScanPathsSynchronous). Use the cached helper-derived path.
     void* arInterfaceClass = nullptr;
     if (s_getByPathFunc) arInterfaceClass = getOuter(s_getByPathFunc);
     if (!arInterfaceClass) arInterfaceClass = findObject(L"/Script/AssetRegistry.AssetRegistry");
     void* arImplClass = getClass(s_assetRegImpl);
 
+    // Find the UFunction. ScanFilesSynchronous is the only name variant we
+    // care about here (no fallback to ScanPaths or anything else - those
+    // serve different purposes).
     void* scanFn = nullptr;
     if (arInterfaceClass) scanFn = findFunction(arInterfaceClass, L"ScanFilesSynchronous");
     if (!scanFn && arImplClass) scanFn = findFunction(arImplClass, L"ScanFilesSynchronous");
@@ -4890,6 +5805,8 @@ bool scanAssetRegistryFiles(const wchar_t* uassetFilename, bool forceRescan) {
         return false;
     }
 
+    // Diagnostic: read the native fn ptr (UFunction+0xD8) to check whether
+    // ScanFilesSynchronous has a real body or is a stripped stub in this build.
     {
         void* nativeFn = nullptr;
         if (safeReadPtr((uint8_t*)scanFn + UFUNC_FUNC, &nativeFn) && nativeFn) {
@@ -4911,6 +5828,9 @@ bool scanAssetRegistryFiles(const wchar_t* uassetFilename, bool forceRescan) {
         }
     }
 
+    // Build the FString and TArray<FString>{ one element } via GMalloc, same
+    // pattern as ScanPathsSynchronous - UE will read it as if we were the
+    // engine's own caller.
     FStringMinimal pathStr = {};
     if (!buildFString(pathStr, uassetFilename)) {
         Hydro::logWarn("EngineAPI: scanAssetRegistryFiles - failed to allocate FString");
@@ -4949,14 +5869,19 @@ void tryDeferredAssetRegistryDiscovery() {
     // Already discovered? Nothing to do.
     if (s_assetRegHelpersCDO && s_getAssetFunc) return;
 
-    // Throttle: only retry every ~2 seconds (GUObjectArray walk is expensive).
+    // Throttle: only retry every ~2 seconds. discoverAssetRegistry walks
+    // GUObjectArray (via findObject path lookups) which is O(N=900k) on
+    // a miss - running it every engine tick would burn the game thread.
     static uint64_t s_lastAttempt = 0;
     uint64_t now = GetTickCount64();
     if (now - s_lastAttempt < 2000) return;
     s_lastAttempt = now;
 
+    // Skip if prerequisites aren't ready yet (FName ctor + GUObjectArray).
     if (!s_fnameConstructor || !s_guObjectArray) return;
 
+    // Single attempt - if AR CDOs aren't in GUObjectArray yet, this returns
+    // false and we'll retry in 2 seconds.
     if (discoverAssetRegistry() && s_assetRegHelpersCDO && s_getAssetFunc) {
         Hydro::logInfo("EngineAPI: AssetRegistry deferred-init succeeded after %llu ms",
                        now - s_lastAttempt);

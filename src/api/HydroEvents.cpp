@@ -312,7 +312,6 @@ static void* installInlineHookAt(void* target, void* detour, const char* label) 
 }
 
 // Discover ProcessInternal via UE4SS's ExecuteUbergraph trick.
-//
 // ProcessInternal isn't exposed via a vtable entry we can pattern-match
 // easily. But every UFunction has a `Func` native pointer at offset 0xD8,
 // and the `/Script/CoreUObject.Object:ExecuteUbergraph` UFunction's Func
@@ -338,7 +337,6 @@ static void* discoverProcessInternal() {
 // Hook AActor::BeginPlay via vtable swap. BeginPlay is a C++ virtual
 // that the engine calls directly (no ProcessEvent). The vtable offset
 // is 0x3A0 on UE 5.5 - we probe a small window around it.
-//
 // We use a vtable swap (replacing the pointer in the vtable) rather
 // than an inline hook (patching the function's first bytes) because
 // UE4SS may have already inline-hooked BeginPlay. Two inline hooks
@@ -350,12 +348,10 @@ static void __fastcall hydroBeginPlayDetour(void* actor);
 static bool installBeginPlayVtableSwap() {
     // Name is historical - we don't patch vtables, we inline-hook the
     // function pointer stored at AActor's CDO vtable slot 0x3A0 (UE 5.5).
-    //
     // This is the same technique UE4SS uses (resolve via Default__Actor
     // CDO, follow jmp thunks, inline-hook the resolved address) and what
     // every mature UE5 mod loader converges on: Palworld, Hogwarts, Ark
     // Ascended, Satisfactory community tooling all target this exact path.
-    //
     // Why it catches BP actors even though AActor::BeginPlay is virtual:
     //   BP_ThirdPersonCharacter::BeginPlay -> Super -> ACharacter::BeginPlay
     //   -> Super -> APawn::BeginPlay -> Super -> AActor::BeginPlay (HOOK HERE)
@@ -363,12 +359,10 @@ static bool installBeginPlayVtableSwap() {
     // Only AActor::BeginPlay calls ReceiveBeginPlay, so every well-behaved
     // actor chain reaches our hook. Subclasses that override BeginPlay
     // without calling Super are the one legal-but-rare pattern we miss.
-    //
     // Resolving off the AActor CDO (not any subclass) is essential:
     // BP_ThirdPersonCharacter's vtable slot may contain ACharacter::BeginPlay,
     // but AActor's own CDO vtable gives us AActor's implementation - the
     // one every Super::BeginPlay() chain lands on.
-    //
     // Our earlier attempts failed silently because the hand-rolled prologue
     // decoder couldn't handle a `0xE8 call rel32` 13 bytes into BeginPlay's
     // body and fell back to vtable offset 0x3A8 (a different, unrelated
@@ -473,7 +467,6 @@ static bool installInlineHook() {
 // Trace dispatch: iterate active traces, write a JSONL line for each
 // entry whose target matches `obj`. Fast-path exits on empty list so
 // the common case (no active traces) is a single load+branch.
-//
 // Called from all three detours (PE, PI, BP) after the hook dispatch.
 // The `src` tag lets us distinguish PE/PI/BP in the trace output so
 // tools downstream can reason about which dispatch path fired.
@@ -634,7 +627,6 @@ static void fireHooksForFunction(const char* source, void* obj, void* func) {
     // time we see it. Proves the detour is actually being called and
     // shows which function names flow through - useful for diagnosing
     // "my hook never fires" issues (wrong nameIdx, wrong detour path).
-    //
     // Writes to a dedicated HydroEvents-diag.log with flush-per-write so
     // the data survives hard game termination. The main UE4SS log buffers
     // and loses anything in-flight when the game is killed or crashes.
@@ -906,13 +898,11 @@ static int l_events_hook(lua_State* L) {
     return 1;
 }
 
-// ─── Coroutine scheduler (for wait()) ──────────────────────────────────
-//
+// --- Coroutine scheduler (for wait()) ---
 // Top-level mod scripts run inside a Lua coroutine so they can call
 // `wait(seconds)` to yield. The coroutine's state is kept alive via a
 // registry ref; the scheduler resumes it when its wake time is due.
 // Same PE-detour pump as periodics.
-//
 // `wait()` is a global: `wait(1.5)` inside any mod script yields the
 // calling coroutine for 1.5 seconds. Scripts that never call wait just
 // run to completion on their first resume with no additional cost.

@@ -11,7 +11,6 @@ struct lua_State;
 namespace Hydro {
 
 // How a registry responds when an incoming entry collides with an existing one.
-//
 //   Fail     - reject the new entry, return an error to the caller
 //   Warn     - reject the new entry, log a warning, return an error
 //   Override - replace the existing entry, log which mod overrode which

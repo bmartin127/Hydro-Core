@@ -15,7 +15,8 @@ namespace Hydro {
 
 // DLL path utility
 
-// Get the directory containing this DLL.
+// Get the directory containing this DLL. More reliable than
+// current_path() which depends on how the host process was launched.
 static fs::path getDllDirectory() {
 #ifdef _WIN32
     HMODULE hModule = nullptr;
@@ -37,11 +38,14 @@ static fs::path getDllDirectory() {
 
 static LogCallback s_callback = nullptr;
 
-static const Manifest* s_currentManifest = nullptr; // set by Core::initialize; read by API modules
+// Current manifest pointer - set by Core::initialize after a successful
+// load. Read by API modules (HydroNet, etc.) without needing a Core ref.
+static const Manifest* s_currentManifest = nullptr;
 
 const Manifest* getCurrentManifest() { return s_currentManifest; }
 
-// Fallback file logger: writes HydroCore.log next to the DLL when no callback is set.
+// Fallback file logger - used when no callback is set (e.g. unit tests,
+// standalone runs). Writes HydroCore.log next to the DLL.
 static void fallbackLog(LogLevel level, const char* message) {
     static std::ofstream s_file;
     static bool s_opened = false;
@@ -96,12 +100,28 @@ Core::Core() {
 }
 
 Core::~Core() {
-    cleanupDeployedPaks(); // remove our symlinks so the game runs vanilla if HydroCore is absent
+    // Clean any symlinks we created so the game runs vanilla once HydroCore
+    // isn't loaded (e.g. user launches via Steam directly with the proxy
+    // disabled). Best-effort - if files are locked we just log and move on.
+    cleanupDeployedPaks();
     logInfo("Core destroyed");
 }
 
 std::string Core::findGameDirectory() const {
-    // Walk up from the DLL until hydro_mods.json is found (up to 10 levels).
+    // Walk up from the DLL's location looking for hydro_mods.json.
+    // Typical UE5 packaged game layout:
+    //   GameRoot/
+    //   --- GameName.exe
+    //   --- hydro_mods.json           <-- launcher writes this here
+    //   --- GameName/
+    //       --- Binaries/
+    //           --- Win64/
+    //               --- ue4ss/
+    //                   --- Mods/
+    //                       --- HydroCore/
+    //                           --- dlls/
+    //                               --- main.dll  <-- this DLL
+
     fs::path dir = getDllDirectory();
 
     for (int i = 0; i < 10; i++) {
@@ -109,7 +129,7 @@ std::string Core::findGameDirectory() const {
             return dir.string();
         }
         fs::path parent = dir.parent_path();
-        if (parent == dir) break;
+        if (parent == dir) break; // filesystem root
         dir = parent;
     }
 
@@ -155,6 +175,10 @@ void Core::initialize(const std::string& gameRootHint) {
                         logInfo("    %s [%s]", file.fileName.c_str(), file.fileType.c_str());
                     }
                 }
+                // Symlink the manifest's mod paks into Content/Paks/LogicMods/
+                // BEFORE the engine's pak auto-mount runs at startup. We get
+                // here from start_mod()/DLL load, which UE4SS calls early
+                // enough for our symlinks to be visible to UE's first scan.
                 deployPaks();
             } else {
                 logInfo("No manifest - running without launcher mods");
@@ -170,7 +194,9 @@ void Core::initialize(const std::string& gameRootHint) {
         logError("Initialization failed: unknown error");
     }
 
-    m_initialized = true; // mark even on failure - don't retry; game should still run
+    // Mark initialized even on failure - don't retry, the game should
+    // still run. Future phases can check m_manifest != nullptr.
+    m_initialized = true;
     logInfo("=== Initialization Complete ===");
 }
 
@@ -228,9 +254,15 @@ void Core::initPakLoader() {
 }
 
 void Core::executePakMounts() {
-    // Paks are deployed to LogicMods/ at construction time so UE's startup scan picks them up.
-    // Runtime mount is disabled by default (IoStore games seal FPackageStore before any runtime
-    // mount fires). Set HYDRO_RUNTIME_MOUNT=1 to enable the runtime path for experiments.
+    // Default behavior: rely on UE's engine-init pak auto-mount (the same path
+    // UE4SS BPModLoader uses). Paks are symlinked into Content/Paks/LogicMods/
+    // by deployPaks() during construction, before engine init, so the engine's
+    // own scan picks them up and indexes them in IoStore alongside base game
+    // content. Runtime mount via FPakPlatformFile::Mount can't replicate this:
+    // on IoStore-shipped games, FPackageStore is fed only by FIoDispatcher's
+    // startup .utoc scan, which is sealed before any runtime mount could fire.
+    // Opt-in HYDRO_RUNTIME_MOUNT=1 keeps the runtime path live for stock-UE
+    // hot-reload experiments and architectural research.
     {
         char buf[16] = {};
         DWORD got = GetEnvironmentVariableA("HYDRO_RUNTIME_MOUNT", buf, sizeof(buf));
@@ -267,7 +299,11 @@ void Core::executePakMounts() {
 
 namespace {
 
-// Returns Content/Paks/LogicMods/, creating it if missing. Empty on failure.
+// Returns the game's `<Project>/Content/Paks/LogicMods/` path, creating it
+// if missing. Empty string on failure.
+// `gameDir` is the location of `hydro_mods.json` - typically
+// `<game>/<Project>/Binaries/Win64/`, NOT the project root. So we walk
+// UP looking for `Content/Paks/` (same pattern as PakLoader uses).
 fs::path findHydroModsDir(const std::string& gameDir) {
     fs::path dir(gameDir);
     for (int i = 0; i < 5; i++) {
@@ -285,17 +321,8 @@ fs::path findHydroModsDir(const std::string& gameDir) {
     return {};
 }
 
-// Try to symlink src to dst; fall back to copy. Returns "symlink"/"copy"/"" on failure.
+// File symlinks on Windows need SeCreateSymbolicLinkPrivilege; just copy.
 const char* linkOrCopy(const fs::path& src, const fs::path& dst) {
-#ifdef _WIN32
-    if (CreateSymbolicLinkW(dst.c_str(), src.c_str(), 0)) {
-        return "symlink";
-    }
-#else
-    std::error_code sec;
-    fs::create_symlink(src, dst, sec);
-    if (!sec) return "symlink";
-#endif
     std::error_code cec;
     fs::copy_file(src, dst, fs::copy_options::overwrite_existing, cec);
     return cec ? "" : "copy";
@@ -305,32 +332,44 @@ const char* linkOrCopy(const fs::path& src, const fs::path& dst) {
 
 bool Core::cleanupDeployedPaks() {
     if (m_gameDirectory.empty()) return false;
-    fs::path dir = findHydroModsDir(m_gameDirectory);
-    if (dir.empty()) return false;
+    fs::path logicMods = findHydroModsDir(m_gameDirectory);
+    if (logicMods.empty()) return false;
+
+    // Walk both LogicMods/ and legacy HydroMods/. Stale paks in HydroMods/
+    // still get auto-mounted by UE and collide with fresh pakchunk paks.
+    fs::path paksRoot = logicMods.parent_path();
+    fs::path legacyDirs[] = { logicMods, paksRoot / "HydroMods" };
 
     int removed = 0;
-    std::error_code ec;
-    for (const auto& entry : fs::directory_iterator(dir, ec)) {
-        if (!entry.is_regular_file() && !entry.is_symlink()) continue;
-        std::string name = entry.path().filename().string();
-        // Match: legacy "Hydro_*", transient "pakchunk<N>-Hydro_*", and
-        // current "pakchunk<N>-Windows.*" where N ∈ [10000,99999] (our FNV-1a range).
-        bool isOurs = (name.rfind("Hydro_", 0) == 0) ||
-                      (name.find("-Hydro_") != std::string::npos);
-        if (!isOurs && name.rfind("pakchunk", 0) == 0) {
-            size_t end = 8;
-            while (end < name.size() && name[end] >= '0' && name[end] <= '9') end++;
-            if (end > 8) {
-                int n = atoi(name.substr(8, end - 8).c_str());
-                if (n >= 10000 && n <= 99999) isOurs = true;
+    for (const auto& dir : legacyDirs) {
+        std::error_code ec;
+        if (!fs::is_directory(dir, ec)) continue;
+        for (const auto& entry : fs::directory_iterator(dir, ec)) {
+            if (!entry.is_regular_file() && !entry.is_symlink()) continue;
+            std::string name = entry.path().filename().string();
+            // Match three shapes:
+            //   1. legacy `Hydro_*` (pre-chunked-shader-library era)
+            //   2. transient `pakchunk<N>-Hydro_*` (one-day intermediate)
+            //   3. current `pakchunk<N>-Windows.<ext>` where N is in [10000,99999]
+            //      (our reserved chunk-index range from the FNV-1a mod_id hash).
+            bool isOurs = (name.rfind("Hydro_", 0) == 0) ||
+                          (name.find("-Hydro_") != std::string::npos);
+            if (!isOurs && name.rfind("pakchunk", 0) == 0) {
+                // Parse digits after "pakchunk" up to the next '-' or '.'
+                size_t end = 8;
+                while (end < name.size() && name[end] >= '0' && name[end] <= '9') end++;
+                if (end > 8) {
+                    int n = atoi(name.substr(8, end - 8).c_str());
+                    if (n >= 10000 && n <= 99999) isOurs = true;
+                }
             }
+            if (!isOurs) continue;
+            std::error_code rmec;
+            fs::remove(entry.path(), rmec);
+            if (!rmec) removed++;
         }
-        if (!isOurs) continue;
-        std::error_code rmec;
-        fs::remove(entry.path(), rmec);
-        if (!rmec) removed++;
     }
-    if (removed > 0) logInfo("Cleaned %d Hydro_* file(s) from LogicMods/", removed);
+    if (removed > 0) logInfo("Cleaned %d Hydro_* file(s) from LogicMods/+HydroMods/", removed);
     return true;
 }
 
@@ -347,7 +386,9 @@ bool Core::deployPaks() {
         return false;
     }
 
-    cleanupDeployedPaks(); // remove orphans from previous session
+    // Always start clean - orphan Hydro_* from a previous session would
+    // collide with this run's symlinks and confuse load priority.
+    cleanupDeployedPaks();
 
     int linked = 0;
     for (const auto& mod : m_manifest->getMods()) {
@@ -361,15 +402,26 @@ bool Core::deployPaks() {
             }
             std::string baseStem = pakSrc.stem().string();
 
-            // Deploy .pak plus IoStore companions (.utoc, .ucas).
+            // Deploy the .pak plus its IoStore companions (.utoc, .ucas).
+            // UE 5.x materials only render correctly when all three are
+            // co-mounted at engine init - runtime pak mounting can't
+            // register shader-library chunks with the renderer's
+            // already-initialized shader library.
+            // The `_P` suffix is UE's "patch" marker - bumps load priority
+            // so our content overrides anything the game's own pak baked.
             for (const char* ext : {"pak", "utoc", "ucas"}) {
                 fs::path sibling = pakSrc;
                 sibling.replace_extension(ext);
                 if (!fs::exists(sibling)) continue;
 
-                // Filename must start with "pakchunk<N>" so PakGetPakchunkIndex extracts N,
-                // which UE uses in GetShaderLibraryNameForChunk to auto-merge our shader archive.
-                // N = FNV-1a(mod.modId) mapped to [10000,99999] - MUST match hydro-cli build.rs.
+                // Filename MUST start with "pakchunk<N>" so UE's PakGetPakchunkIndex
+                // parses N as the pak's chunk index. UE then uses that index in
+                // GetShaderLibraryNameForChunk("<HostProject>", N) -> "<HostProject>_Chunk<N>",
+                // which matches the in-pak shader archive name written by hydro-cli.
+                // N is a deterministic FNV-1a 32-bit hash of mod.modId mapped into
+                // [10000, 99999]. Same algorithm in `hydro-cli/src/build.rs::
+                // stable_chunk_index_for_mod` - both sides MUST stay in sync; if
+                // you change one, change both.
                 uint32_t chunkIndex = 0x811C9DC5u;
                 for (unsigned char c : mod.modId) {
                     chunkIndex ^= c;
@@ -381,6 +433,8 @@ bool Core::deployPaks() {
                     "pakchunk" + std::to_string(chunkIndex) + "-Windows." + std::string(ext);
                 fs::path dest = target / destName;
 
+                // Best-effort overwrite (cleanup above should have wiped these,
+                // but a stray symlink can survive a crash).
                 std::error_code rmec;
                 fs::remove(dest, rmec);
 

@@ -128,7 +128,6 @@ static int l_assets_spawn(lua_State* L) {
     //      including from runtime-mounted mod paks whose contents were
     //      never in the original game's AssetRegistry. This is the tier
     //      that makes runtime mod content-loading actually work.
-    //
     // Validate each tier: on hosts where the UFunction layout discovery
     // misfires (e.g. Palworld's forked engine), `loadAsset` can return a
     // bogus value (an FName index packed as void*). Real x64 user-mode heap

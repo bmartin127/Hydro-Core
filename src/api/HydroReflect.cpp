@@ -231,7 +231,6 @@ static void buildClassCache() {
 }
 
 // findClass(query) -> array of { name }
-//
 // Enumerates classes by collecting unique ClassPrivate pointers from every
 // object in GUObjectArray. Class set is cached after first call.
 // Filters by case-insensitive substring match on the class name.
@@ -278,7 +277,6 @@ static int l_functions(lua_State* L) {
     // Children field (at the same offset as ChildProperties for UStruct)
     // holds UField children which includes UFunctions. We use the existing
     // findFunction infrastructure but iterate instead of searching by name.
-    //
     // UStruct::Children is at offset 0x48 (after SuperStruct at 0x40).
     // Each child is a UField with a Next pointer at offset 0x28.
     constexpr int CHILDREN_OFFSET = 0x48;
@@ -510,7 +508,6 @@ static int l_assets(lua_State* L) {
 }
 
 // dump(outputDir) -> { classes, files }
-//
 // Full reflection dump. With FNamePool direct reading, name resolution is
 // just memory reads - no ProcessEvent calls. The entire dump of ~10k classes
 // completes in under a second with no game stutter.
@@ -729,7 +726,6 @@ static void writeStructJson(std::ostream& out, void* ustruct,
 // Write a UEnum as JSON. Reads the Names TArray via readEnumNames and
 // emits each (name, value) pair. Schema: {schemaVersion, kind: "enum",
 // name, path, values: [{name, value}]}.
-//
 // Enum entry names come from the FNamePool as fully-qualified
 // "EnumName::EntryName" strings because that's how UE stores them
 // internally. We strip the "EnumName::" prefix so consumers see clean
@@ -864,12 +860,10 @@ static void* findClassMetaclass() {
 
 // trace{target, seconds, output} - log every PE/PI/BP call on the given
 // target UObject for `seconds` seconds to a JSONL file at `output`.
-//
 // target: UObject userdata (from Reflect.findAll / findFirstOf) OR a path
 //         string (e.g. "/Script/Engine.Actor") resolved via findObject.
 // seconds: trace duration in wall-clock seconds (approximately 60 game ticks).
 // output: path to the output JSONL file. Parent directories are created.
-//
 // Returns {ok, expireTick, target} on success or raises a Lua error.
 static int l_trace(lua_State* L) {
     if (!lua_istable(L, 1)) {
@@ -966,7 +960,7 @@ static int l_dump(lua_State* L) {
         assetsFile.open(outRoot / "_assets.jsonl");
     }
 
-    // ── Single pass over GUObjectArray ─────────────────────────────────
+    // -- Single pass over GUObjectArray ---
     int32_t total = Engine::getObjectCount();
     int rawCount = 0;
     for (int32_t i = 0; i < total; i++) {
@@ -1059,7 +1053,7 @@ static int l_dump(lua_State* L) {
 
     if (assetsFile.is_open()) assetsFile.close();
 
-    // ── Walk class SuperStruct chains ──────────────────────────────────
+    // -- Walk class SuperStruct chains ---
     // Parents of live classes that may not themselves have instances in
     // GUObjectArray. Walking super chains here instead of at insertion
     // time avoids modifying classSet while iterating the array.
@@ -1078,7 +1072,7 @@ static int l_dump(lua_State* L) {
     Hydro::logInfo("[Hydro.Reflect] Dumping %zu validated classes (from %d raw) to '%s' (%s)...",
                    classSet.size(), rawCount, outputDir, asJson ? "JSON" : "text");
 
-    // ── Emit class files ───────────────────────────────────────────────
+    // -- Emit class files ---
     int filesWritten = 0;
     for (void* cls : classSet) {
         std::string className;

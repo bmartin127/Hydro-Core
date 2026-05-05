@@ -9,6 +9,7 @@ add_library(${TARGET} SHARED
     Manifest.cpp
     ModManifest.cpp
     PakLoader.cpp
+    RawFunctions.cpp
     registry/Registry.cpp
     registry/RegistryManager.cpp
     api/HydroAssets.cpp

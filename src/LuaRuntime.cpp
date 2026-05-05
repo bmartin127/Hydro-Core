@@ -246,7 +246,6 @@ bool LuaRuntime::executeModScript(const std::string& modId, const std::string& s
     // Execute in a coroutine so the script can call wait() to yield. Non-
     // yielding scripts complete on first resume with no additional cost;
     // scripts that wait get registered with the Hydro.Events scheduler.
-    //
     // Stack manipulation: the loaded chunk is currently at top-of-stack.
     // lua_newthread pushes the new thread on top of the chunk. We then
     // swap them (so the chunk is on top) before xmoving the chunk into

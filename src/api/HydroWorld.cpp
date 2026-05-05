@@ -150,7 +150,6 @@ static int l_world_getGameplayStatics(lua_State* L) {
 }
 
 // World.getPlayer / getPlayerPawn / findAllOfClass
-//
 // These route through UE's own UGameplayStatics functions instead of
 // scanning GUObjectArray. They're the preferred way to find the player
 // and iterate typed actors - faster AND more stable across engine

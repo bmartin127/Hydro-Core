@@ -1,6 +1,7 @@
 #include "PakLoader.h"
 #include "HydroCore.h"
 #include "EngineAPI.h"
+#include "RawFunctions.h"
 #include "SEH.h"
 #include <Unreal/FString.hpp>
 
@@ -13,6 +14,10 @@ namespace fs = std::filesystem;
 
 namespace Hydro {
 
+// FPakPlatformFile vtable (UE 5.5, MSVC). GetName index is UE-version-dependent.
+constexpr int kVTable_DeletingDtor = 0;
+constexpr int kVTable_GetName_UE55 = 14;
+
 // SEH wrappers
 
 static bool safeReadBytes(void* addr, uint8_t* out, size_t count) {
@@ -23,11 +28,12 @@ static bool safeCallGetName(void* obj, const wchar_t** out) {
     using Fn = const wchar_t*(__fastcall*)(void*);
     HYDRO_SEH_TRY({
         void** vtable = *(void***)obj;
-        *out = ((Fn)vtable[14])(obj);
+        *out = ((Fn)vtable[kVTable_GetName_UE55])(obj);
     });
 }
 
-// UE 4.27+ / UE5 delegate object layout.
+// Observed delegate layout (UE 4.27+/UE5).
+// MountFn = bool (*)(FPakPlatformFile*, FString&, uint32_t)
 struct MountDelegate {
     void* pad1;
     void* pad2;
@@ -71,120 +77,65 @@ static GameModule findGameModule() {
 #endif
 }
 
-// Scan for FPakPlatformFile destructor, walk it for mov rcx, [rip+xx]
-// instructions to recover the global Mount delegate object.
+// Find vtable via L"PakFile" GetName, walk vtable[0] (dtor) for delegate refs.
 static MountDelegate* FindMountDelegate(GameModule gm, void** outPak, void** outFn) {
     uint8_t* base = gm.base;
     size_t size = gm.size;
 
-    const char* dtorPatterns[] = {
-        "40 53 56 57 48 83 EC 20 48 8D 05 ?? ?? ?? ?? 4C 89 74 24 50 48 89 01 48 8B F9 E8",
-        "40 53 56 57 48 83 EC 20 48 8D 05 ?? ?? ?? ?? 48 89 01 48 8B F9",
-    };
-
-    // Parse pattern string into bytes
-    auto parsePattern = [](const char* pat) -> std::vector<std::pair<uint8_t, bool>> {
-        std::vector<std::pair<uint8_t, bool>> bytes;
-        for (const char* p = pat; *p;) {
-            while (*p == ' ') p++;
-            if (!*p) break;
-            if (*p == '?') { bytes.push_back({0, true}); p++; if (*p == '?') p++; }
-            else { bytes.push_back({(uint8_t)strtol(p, nullptr, 16), false}); p += 2; }
-        }
-        return bytes;
-    };
+    const uint8_t pakFileStr[] = {'P',0,'a',0,'k',0,'F',0,'i',0,'l',0,'e',0,0,0};
+    uint8_t* strAddr = nullptr;
+    for (size_t i = 0; i + sizeof(pakFileStr) <= size; i++) {
+        if (memcmp(base + i, pakFileStr, sizeof(pakFileStr)) == 0) { strAddr = base + i; break; }
+    }
+    if (!strAddr) {
+        logError("PakLoader: L\"PakFile\" string not found in module");
+        return nullptr;
+    }
 
     uint8_t* dtorAddr = nullptr;
+    for (size_t i = 0; i + 7 < size && !dtorAddr; i++) {
+        if ((base[i] != 0x48 && base[i] != 0x4C) || base[i+1] != 0x8D || (base[i+2] & 0xC7) != 0x05) continue;
+        int32_t disp = *(int32_t*)(base + i + 3);
+        if (base + i + 7 + disp != strAddr) continue;
 
-    for (const char* pat : dtorPatterns) {
-        auto bytes = parsePattern(pat);
-        for (size_t i = 0; i + bytes.size() <= size; i++) {
-            bool match = true;
-            for (size_t j = 0; j < bytes.size(); j++) {
-                if (!bytes[j].second && base[i + j] != bytes[j].first) { match = false; break; }
+        // The vtable entry pointing into this function is GetName.
+        for (size_t vi = 0; vi + 8 <= size; vi += 8) {
+            void* entry = *(void**)(base + vi);
+            if (!entry || (uint8_t*)entry < base || (uint8_t*)entry >= base + size) continue;
+            ptrdiff_t diff = (uint8_t*)entry - (base + i);
+            if (diff < -4 || diff > 0) continue;
+
+            void** vtable = (void**)(base + vi) - kVTable_GetName_UE55;
+            if ((uint8_t*)vtable < base || (uint8_t*)vtable + 120 > base + size) continue;
+
+            logInfo("PakLoader: Found vtable at exe+0x%zX", (size_t)((uint8_t*)vtable - base));
+
+            uint8_t* dtor = (uint8_t*)vtable[kVTable_DeletingDtor];
+            if (dtor < base || dtor >= base + size) continue;
+
+            logInfo("PakLoader: vtable[0] at exe+0x%zX", (size_t)(dtor - base));
+            dtorAddr = dtor;
+
+            // vtable[0] can be a thunk; follow an early E8 rel32.
+            for (int off = 0; off < 32; off++) {
+                if (dtor[off] == 0xE8) {
+                    int32_t rel = *(int32_t*)(dtor + off + 1);
+                    uint8_t* target = dtor + off + 5 + rel;
+                    if (target >= base && target < base + size) {
+                        logInfo("PakLoader:   call at +%d -> exe+0x%zX (using as real dtor)",
+                            off, (size_t)(target - base));
+                        dtorAddr = target;
+                    }
+                    break;
+                }
             }
-            if (match) {
-                dtorAddr = base + i;
-                logInfo("PakLoader: Found destructor at exe+0x%zX", i);
-                break;
-            }
+            break;
         }
-        if (dtorAddr) break;
     }
 
     if (!dtorAddr) {
-        logInfo("PakLoader: Standard destructor pattern not found - trying vtable-based search...");
-
-        // Fallback path: find the FPakPlatformFile vtable via its L"PakFile" name
-        // string, then pull the destructor out of vtable[0].
-        const uint8_t pakFileStr[] = {'P',0,'a',0,'k',0,'F',0,'i',0,'l',0,'e',0,0,0};
-        uint8_t* strAddr = nullptr;
-        for (size_t i = 0; i + sizeof(pakFileStr) <= size; i++) {
-            if (memcmp(base + i, pakFileStr, sizeof(pakFileStr)) == 0) { strAddr = base + i; break; }
-        }
-
-        if (strAddr) {
-            // Find lea refs to the string
-            for (size_t i = 0; i + 7 < size; i++) {
-                if ((base[i] != 0x48 && base[i] != 0x4C) || base[i+1] != 0x8D || (base[i+2] & 0xC7) != 0x05) continue;
-                int32_t disp = *(int32_t*)(base + i + 3);
-                if (base + i + 7 + disp != strAddr) continue;
-
-                // Found a lea to L"PakFile". Find vtable entry pointing near here.
-                for (size_t vi = 0; vi + 8 <= size; vi += 8) {
-                    void* entry = *(void**)(base + vi);
-                    if (!entry || (uint8_t*)entry < base || (uint8_t*)entry >= base + size) continue;
-                    ptrdiff_t diff = (uint8_t*)entry - (base + i);
-                    if (diff < -4 || diff > 0) continue;
-
-                    void** vtable = (void**)(base + vi) - 14; // GetName is at index 14
-                    if ((uint8_t*)vtable < base || (uint8_t*)vtable + 120 > base + size) continue;
-
-                    logInfo("PakLoader: Found vtable at exe+0x%zX", (size_t)((uint8_t*)vtable - base));
-
-                    // The destructor is vtable[0]. Go directly to it.
-                    uint8_t* dtor = (uint8_t*)vtable[0];
-                    if (dtor >= base && dtor < base + size) {
-                        logInfo("PakLoader: vtable[0] at exe+0x%zX", (size_t)(dtor - base));
-
-                        // Log first bytes to identify the function
-                        uint8_t head[16];
-                        if (safeReadBytes(dtor, head, 16)) {
-                            logInfo("PakLoader:   bytes: %02X %02X %02X %02X %02X %02X %02X %02X",
-                                head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7]);
-                        }
-
-                        // vtable[0] is the MSVC deleting destructor, which is sometimes
-                        // a thunk that calls the actual destructor then operator delete.
-                        // Use vtable[0] directly, but if it contains an early call, follow
-                        // the target too.
-                        dtorAddr = dtor;
-                        logInfo("PakLoader: Using vtable[0] as destructor");
-
-                        for (int off = 0; off < 32; off++) {
-                            if (dtor[off] == 0xE8) { // call rel32
-                                int32_t rel = *(int32_t*)(dtor + off + 1);
-                                uint8_t* target = dtor + off + 5 + rel;
-                                if (target >= base && target < base + size) {
-                                    logInfo("PakLoader:   call at +%d -> exe+0x%zX (trying this as real dtor)",
-                                        off, (size_t)(target - base));
-                                    dtorAddr = target;
-                                }
-                                break;
-                            }
-                        }
-
-                        break;
-                    }
-                }
-                if (dtorAddr) break;
-            }
-        }
-
-        if (!dtorAddr) {
-            logError("PakLoader: Destructor not found via any method");
-            return nullptr;
-        }
+        logError("PakLoader: Destructor not found via vtable search");
+        return nullptr;
     }
 
     // Walk destructor for mov rcx, [rip+offset] instructions (48 8B 0D xx xx xx xx)
@@ -220,6 +171,7 @@ static MountDelegate* FindMountDelegate(GameModule gm, void** outPak, void** out
                     if (safeReadBytes(resolved, (uint8_t*)&delegateObj, 8) && delegateObj) {
                         logInfo("PakLoader: MountPak delegate at %p", delegateObj);
 
+                        // Dump raw bytes to understand layout
                         uint8_t raw[64];
                         if (safeReadBytes(delegateObj, raw, 64)) {
                             for (int s = 0; s < 8; s++) {
@@ -230,13 +182,16 @@ static MountDelegate* FindMountDelegate(GameModule gm, void** outPak, void** out
                             }
                         }
 
-                        // Identify slots: fn points into exe code, pak points
-                        // to a heap object whose vtable name is "PakFile".
+                        // In pak_reloader V427 layout: slot[3]=pak, slot[4]=fn
+                        // But UE5.5 might differ. Try to identify:
+                        // - The fn slot points into exe code
+                        // - The pak slot points to heap (the FPakPlatformFile object)
                         void* foundPak = nullptr;
                         void* foundFn = nullptr;
                         for (int s = 0; s < 8; s++) {
                             void* val = *(void**)(raw + s * 8);
                             bool inExe = ((uint8_t*)val >= base && (uint8_t*)val < base + size);
+                            // The mount fn should look like executable code (common prologue bytes)
                             if (inExe && !foundFn) {
                                 uint8_t fnHead[4];
                                 if (safeReadBytes(val, fnHead, 4)) {
@@ -295,40 +250,17 @@ bool PakLoader::initialize() {
     m_pakPlatformFile = foundPak;
     m_mountFunc = foundFn;
 
-    // Resolve the inner FPakPlatformFile::Mount via its "Mounting pak file"
-    // log string for diagnostics. The raw delegate fn is the outer
-    // HandleMountPakDelegate wrapper which also broadcasts OnPakFileMounted2;
-    // mounting via the inner fn skips the broadcast and AR never indexes.
-    // Keep using the outer wrapper for the actual mount.
-    const uint8_t mountStr[] = {
-        'M',0,'o',0,'u',0,'n',0,'t',0,'i',0,'n',0,'g',0,' ',0,
-        'p',0,'a',0,'k',0,' ',0,'f',0,'i',0,'l',0,'e',0
-    };
-    for (size_t i = 0; i + sizeof(mountStr) <= gm.size; i++) {
-        if (memcmp(gm.base + i, mountStr, sizeof(mountStr)) == 0) {
-            for (size_t j = 0; j + 7 < gm.size; j++) {
-                if ((gm.base[j] != 0x48 && gm.base[j] != 0x4C) || gm.base[j+1] != 0x8D) continue;
-                if ((gm.base[j+2] & 0xC7) != 0x05 && (gm.base[j+2] & 0xC7) != 0x0D) continue;
-                int32_t disp = *(int32_t*)(gm.base + j + 3);
-                if (gm.base + j + 7 + disp == gm.base + i) {
-                    uint8_t* funcStart = gm.base + j;
-                    for (int back = 1; back < 8192; back++) {
-                        if (funcStart[-1] == 0xCC) break;
-                        funcStart--;
-                    }
-                    m_mountFunc = funcStart;
-                    logInfo("PakLoader: inner Mount fn at exe+0x%zX - using this", (size_t)(funcStart - gm.base));
-                    goto found_string_mount;
-                }
-            }
-            break;
-        }
-    }
-    found_string_mount:
-    if (m_mountFunc == foundFn) {
-        logInfo("PakLoader: String anchor not found - falling back to raw delegate fn at %p (may crash)", m_mountFunc);
+    // slot[4] is HandleMountPakDelegate (wraps Mount + broadcasts
+    // OnPakFileMounted2). Prefer the inner Mount via RawFn.
+    using namespace ::Hydro::Engine::RawFn;
+    registerFn("FPakPlatformFile_Mount", { Strategy::StringRefAnchor,
+        L"Mounting pak file", 0 });
+    void* innerMount = resolve("FPakPlatformFile_Mount");
+    if (innerMount) {
+        m_mountFunc = innerMount;
+        logInfo("PakLoader: Mount fn resolved via registry to %p", innerMount);
     } else {
-        logInfo("PakLoader: Mount fn resolved to anchored inner fn at %p", m_mountFunc);
+        logInfo("PakLoader: Registry resolve failed; using raw delegate fn at %p (may crash)", m_mountFunc);
     }
 
     logInfo("PakLoader: Ready - pak=%p, mount=%p", m_pakPlatformFile, m_mountFunc);
@@ -345,12 +277,13 @@ PakMountResult PakLoader::mountPak(const std::string& pakPath, const std::string
         return result;
     }
 
-    // FString allocated via GMalloc.
+    // Build FString using UE4SS's FString (allocates via GMalloc)
     std::wstring wide(pakPath.begin(), pakPath.end());
     RC::Unreal::FString fstr(wide.c_str());
 
     logInfo("PakLoader: Mounting %s (order=%d)", pakPath.c_str(), priority);
 
+    // Snapshot FPakPlatformFile before mount to detect MountedPaks list changes
     uint8_t snapBefore[320] = {};
     safeReadBytes(m_pakPlatformFile, snapBefore, 320);
 
@@ -360,7 +293,8 @@ PakMountResult PakLoader::mountPak(const std::string& pakPath, const std::string
 
     logInfo("PakLoader: Result: %p (crashed=%d)", pakFile, crashed);
 
-    // Detect MountedPaks list growth by scanning for int32 +1 increments.
+    // Compare snapshot: look for int32 fields that incremented by 1 - those are
+    // TArray element counts, indicating the pak was added to an internal list.
     {
         uint8_t snapAfter[320] = {};
         bool anyChange = false;
@@ -383,11 +317,17 @@ PakMountResult PakLoader::mountPak(const std::string& pakPath, const std::string
         result.success = true; m_mountedCount++;
         logInfo("PakLoader: Mount returned success");
     } else {
-        // IoStore games return null with no companion .utoc, but the pak is
-        // still on the internal PakFiles list - count as mounted.
+        // In IoStore games Mount returns null because there's no companion .utoc,
+        // but the pak is still added to the internal PakFiles list so it counts
+        // as mounted for our purposes.
         result.success = true; m_mountedCount++;
         logInfo("PakLoader: Mount returned null (IoStore check failed) - pak may still be mounted");
     }
+
+    // (Shader library registration moved to dllmain.cpp::on_unreal_init -
+    // this mountPak path only runs when HYDRO_RUNTIME_MOUNT=1 is set, but
+    // the default flow lets UE auto-mount our symlinked paks during engine
+    // init, so the OpenLibrary call must fire from the engine-ready hook.)
 
     return result;
 }
