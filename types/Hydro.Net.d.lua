@@ -1,18 +1,22 @@
 ---@meta
 
 --- @module Hydro.Net
---- @description Network role detection and modpack identity.
----     Net.isHost()         -> boolean
----     Net.mode()           -> "standalone" | "listen_server" | "dedicated_server" | "client" | "unknown"
----     Net.getModpackHash() -> string (16-char hex, FNV-1a over the sorted enabled mod set)
+--- @description Network role detection and modpack identity for multiplayer mods.
+---   Foundational hooks every multiplayer-aware mod needs:
+---     Net.isHost()         - am I the authoritative host?
+---     Net.mode()           - what role am I playing?
+---     Net.getModpackHash() - deterministic identity for the active mod set
 ---
----   Custom RPCs are not provided. Mod-to-mod network sync goes through the
----   game's existing replicated actors; `Hydro.Events.hook()` catches
----   network-replicated UFunction calls regardless of dispatch path.
+---   Does NOT yet provide custom RPCs (send/broadcast/on). Those land once
+---   the per-game replicated router asset is available. For now, mod-to-mod
+---   network sync goes through the game's existing replicated actors -
+---   `Hydro.Events.hook()` already catches network-replicated UFunction
+---   calls regardless of dispatch path.
 ---
----   Security: in P2P listen-server games the host is fully authoritative
----   and can lie to clients. UE replication is a transport, not a trust
----   boundary. Validate joiner-supplied data on the host.
+---   **Security note:** in P2P listen-server games (e.g. SN2), the host has
+---   full authority and can arbitrarily lie to clients. UE replication is a
+---   transport, not a trust boundary. Validate joiner-supplied data on the
+---   host; assume host-supplied data is authoritative.
 --- @depends EngineAPI (UWorld::GetNetMode), Manifest
 --- @engine_systems UWorld
 
@@ -73,7 +77,8 @@ function Net.mode() end
 ---
 --- Use for informal modpack compatibility checks (e.g. log host's hash on
 --- session start, log joiner's hash on connect, surface mismatch in UI).
---- Not cryptographically secure: a malicious peer can trivially fake it.
+--- This is **not** cryptographically secure - it's a content-addressable
+--- identity, not a signature. A malicious peer can trivially fake it.
 ---
 --- Returns `"0000000000000000"` if no manifest is loaded.
 ---

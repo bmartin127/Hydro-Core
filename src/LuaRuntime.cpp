@@ -89,6 +89,13 @@ bool LuaRuntime::initialize() {
     // Open standard libraries (we'll restrict per-mod via environments)
     luaL_openlibs(m_state);
 
+    // Replace the global `print` so bootstrap code (registerXxxModule
+    // bootstraps that run in _G, not a per-mod env) gets log routing too.
+    // Without this, `print` calls from inside Hydro.UI / Hydro.HUD module
+    // bootstraps disappear into stdout - invisible in shipping builds.
+    lua_pushcfunction(m_state, l_hydro_print);
+    lua_setglobal(m_state, "print");
+
     // Create module registry for safe require()
     lua_newtable(m_state);
     lua_setfield(m_state, LUA_REGISTRYINDEX, "_HYDRO_MODULES");
@@ -246,6 +253,7 @@ bool LuaRuntime::executeModScript(const std::string& modId, const std::string& s
     // Execute in a coroutine so the script can call wait() to yield. Non-
     // yielding scripts complete on first resume with no additional cost;
     // scripts that wait get registered with the Hydro.Events scheduler.
+    //
     // Stack manipulation: the loaded chunk is currently at top-of-stack.
     // lua_newthread pushes the new thread on top of the chunk. We then
     // swap them (so the chunk is on top) before xmoving the chunk into

@@ -1,10 +1,13 @@
 #pragma once
 ///
 /// @module Hydro.Net
-/// @description Network role detection and modpack identity.
-///   isHost() and mode() expose the current UWorld net mode.
-///   getModpackHash() returns a deterministic identifier for the active
-///   mod set. Custom RPC primitives are not implemented here.
+/// @description Network role detection and modpack identity for multiplayer mods.
+///   Provides the foundational hooks every multiplayer-aware mod needs:
+///   - isHost() / mode() - query the current network role at runtime
+///   - getModpackHash() - deterministic identity for the active mod set
+///
+///   Does NOT yet provide a custom RPC primitive (send/broadcast/on) - that
+///   ships once the per-game replicated router asset is available.
 /// @depends EngineAPI (UWorld::GetNetMode via reflection), Manifest
 ///
 

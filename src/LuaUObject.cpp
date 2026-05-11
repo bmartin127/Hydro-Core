@@ -1,6 +1,7 @@
 #include "LuaUObject.h"
 #include "HydroCore.h"
 #include "EngineAPI.h"
+#include "PropertyMarshal.h"
 
 extern "C" {
 #include <lua.h>
@@ -19,126 +20,12 @@ struct UObjectUD {
     void* ptr; // Raw UObject*
 };
 
-// Type dispatch: read a property value and push to Lua
-
+// Single-seam type dispatch lives in PropertyMarshal. This wrapper preserves
+// the (L, obj, prop) public signature used by HydroReflect and __index.
 void pushPropertyValue(lua_State* L, void* obj, void* prop) {
-    using namespace Engine;
-    const auto& types = getPropertyTypeNames();
-    uint32_t typeId = getPropertyTypeNameIndex(prop);
-    int32_t offset = getPropertyOffset(prop);
-    int32_t size = getPropertyElementSize(prop);
-
+    int32_t offset = Engine::getPropertyOffset(prop);
     if (offset < 0) { lua_pushnil(L); return; }
-
-    uint8_t* data = (uint8_t*)obj + offset;
-
-    // Numeric types
-    if (typeId == types.intProperty) {
-        int32_t val = 0;
-        readInt32(data, &val);
-        lua_pushinteger(L, val);
-    }
-    else if (typeId == types.int64Property) {
-        int64_t val = 0;
-        memcpy(&val, data, 8);
-        lua_pushnumber(L, (double)val);
-    }
-    else if (typeId == types.floatProperty) {
-        float val = 0;
-        memcpy(&val, data, 4);
-        lua_pushnumber(L, val);
-    }
-    else if (typeId == types.doubleProperty) {
-        double val = 0;
-        memcpy(&val, data, 8);
-        lua_pushnumber(L, val);
-    }
-    else if (typeId == types.boolProperty) {
-        // UE BoolProperty can be bitfield - size=1 for simple bool
-        uint8_t val = 0;
-        memcpy(&val, data, 1);
-        lua_pushboolean(L, val != 0);
-    }
-    else if (typeId == types.byteProperty || typeId == types.int8Property) {
-        lua_pushinteger(L, *(int8_t*)data);
-    }
-    else if (typeId == types.uint16Property || typeId == types.int16Property) {
-        int16_t val = 0;
-        memcpy(&val, data, 2);
-        lua_pushinteger(L, val);
-    }
-    else if (typeId == types.uint32Property) {
-        uint32_t val = 0;
-        memcpy(&val, data, 4);
-        lua_pushnumber(L, val);
-    }
-    else if (typeId == types.enumProperty) {
-        // Enums stored as uint8 in UE5
-        lua_pushinteger(L, *(uint8_t*)data);
-    }
-    // String types
-    else if (typeId == types.strProperty) {
-        // FString layout: TCHAR* Data (pointer), int32 Num, int32 Max
-        void* strData = nullptr;
-        readPtr(data, &strData);
-        if (strData) {
-            // Convert TCHAR (wchar_t) to UTF-8
-            const wchar_t* wstr = (const wchar_t*)strData;
-            int len = 0;
-            while (wstr[len] && len < 4096) len++;
-            std::string utf8(len, '\0');
-            for (int i = 0; i < len; i++) utf8[i] = (char)wstr[i]; // Simple narrow (ASCII safe)
-            lua_pushlstring(L, utf8.c_str(), utf8.size());
-        } else {
-            lua_pushstring(L, "");
-        }
-    }
-    else if (typeId == types.nameProperty) {
-        // FName: just push the comparison index as a number for now
-        uint32_t nameIdx = 0;
-        readInt32(data, (int32_t*)&nameIdx);
-        lua_pushinteger(L, nameIdx);
-    }
-    // Object references
-    else if (typeId == types.objectProperty || typeId == types.classProperty) {
-        void* ref = nullptr;
-        readPtr(data, &ref);
-        pushUObject(L, ref);
-    }
-    // Struct types
-    else if (typeId == types.structProperty) {
-        // Push as a table with raw bytes accessible
-        // For common structs (FVector, FRotator), provide named fields
-        // For now: push FVector-like structs as {X, Y, Z}
-        if (size == 24) {
-            // Likely FVector (3 doubles in UE5)
-            lua_newtable(L);
-            double x, y, z;
-            memcpy(&x, data, 8);
-            memcpy(&y, data + 8, 8);
-            memcpy(&z, data + 16, 8);
-            lua_pushnumber(L, x); lua_setfield(L, -2, "X");
-            lua_pushnumber(L, y); lua_setfield(L, -2, "Y");
-            lua_pushnumber(L, z); lua_setfield(L, -2, "Z");
-        } else if (size == 12) {
-            // Likely FVector with floats (pre-UE5)
-            lua_newtable(L);
-            float x, y, z;
-            memcpy(&x, data, 4);
-            memcpy(&y, data + 4, 4);
-            memcpy(&z, data + 8, 4);
-            lua_pushnumber(L, x); lua_setfield(L, -2, "X");
-            lua_pushnumber(L, y); lua_setfield(L, -2, "Y");
-            lua_pushnumber(L, z); lua_setfield(L, -2, "Z");
-        } else {
-            // Generic struct - push as lightuserdata for now
-            lua_pushlightuserdata(L, data);
-        }
-    }
-    // Fallback
-    else {
-        lua_pushnil(L);
-    }
+    PropertyMarshal::readToLua(L, prop, (const uint8_t*)obj + offset);
 }
 
 // Lua closure body for invoking a UFunction discovered via obj:FunctionName().
@@ -148,24 +35,31 @@ static int uobject_call_function(lua_State* L) {
     void* obj = lua_touserdata(L, lua_upvalueindex(1));
     void* fn = lua_touserdata(L, lua_upvalueindex(2));
 
-    // Derive ParmsSize / RetOffset from the UFunction's parameter chain
-    // (Layer 3) - robust against UE-version layout shifts.
+    // ParmsSize derived from the UFunction's parameter chain (Layer 3) -
+    // robust against UE-version layout shifts. The return-slot offset comes
+    // from the property chain walk below, so we no longer need a precomputed
+    // retOffset; CPF_ReturnParm + getPropertyOffset gives us the same answer
+    // and works for out-params too.
     uint16_t parmsSize = Engine::getUFunctionParmsSize(fn);
-    uint16_t retOffset = Engine::getUFunctionRetOffset(fn);
 
     // Allocate param buffer
     uint8_t* params = (uint8_t*)alloca(parmsSize > 0 ? parmsSize : 8);
     memset(params, 0, parmsSize > 0 ? parmsSize : 8);
 
-    // Fill params from Lua arguments by walking the UFunction's property chain
+    // Fill params from Lua arguments by walking the UFunction's property
+    // chain. Routes through PropertyMarshal so every type the marshal learns
+    // becomes a callable arg automatically. Unsupported types stay zeroed -
+    // matches prior behaviour, which other paths rely on.
     void* paramProp = Engine::getChildProperties(fn);
-    int argIdx = 1; // Lua args start at 1 (self is handled by upvalue)
-    while (paramProp) {
-        int32_t off = Engine::getPropertyOffset(paramProp);
-        int32_t sz = Engine::getPropertyElementSize(paramProp);
-        uint32_t typeId = Engine::getPropertyTypeNameIndex(paramProp);
-        const auto& types = Engine::getPropertyTypeNames();
 
+    // `obj:Method(arg)` colon syntax pushes `self` as Lua arg 1 even though
+    // we already have the receiver via upvalue. Detect that case and start
+    // from arg 2 so the first real input lines up with the first param.
+    int argIdx = 1;
+    if (lua_gettop(L) >= 1 && lua_isuserdata(L, 1) && checkUObject(L, 1) == obj) {
+        argIdx = 2;
+    }
+    while (paramProp) {
         uint64_t pflags = Engine::getPropertyFlags(paramProp);
 
         // Skip return value - identified by CPF_ReturnParm flag
@@ -175,31 +69,10 @@ static int uobject_call_function(lua_State* L) {
         }
 
         if (argIdx <= lua_gettop(L)) {
-            uint8_t* dest = params + off;
-
-            if (typeId == types.intProperty || typeId == types.int8Property ||
-                typeId == types.int16Property || typeId == types.enumProperty ||
-                typeId == types.byteProperty) {
-                int32_t val = (int32_t)luaL_checkinteger(L, argIdx);
-                memcpy(dest, &val, sz > 4 ? 4 : sz);
+            int32_t off = Engine::getPropertyOffset(paramProp);
+            if (off >= 0) {
+                PropertyMarshal::writeFromLua(L, paramProp, params + off, argIdx);
             }
-            else if (typeId == types.floatProperty) {
-                float val = (float)luaL_checknumber(L, argIdx);
-                memcpy(dest, &val, 4);
-            }
-            else if (typeId == types.doubleProperty) {
-                double val = luaL_checknumber(L, argIdx);
-                memcpy(dest, &val, 8);
-            }
-            else if (typeId == types.boolProperty) {
-                uint8_t val = lua_toboolean(L, argIdx) ? 1 : 0;
-                memcpy(dest, &val, 1);
-            }
-            else if (typeId == types.objectProperty || typeId == types.classProperty) {
-                void* ref = checkUObject(L, argIdx);
-                memcpy(dest, &ref, 8);
-            }
-            // TODO: FString, FVector, struct params
             argIdx++;
         }
 
@@ -211,31 +84,28 @@ static int uobject_call_function(lua_State* L) {
         return luaL_error(L, "ProcessEvent failed");
     }
 
-    // Return value
-    if (retOffset < parmsSize) {
-        // For now, return as lightuserdata or number based on size
-        void* retVal = nullptr;
-        memcpy(&retVal, params + retOffset, 8);
-        if (retVal) {
-            // UObject* detection heuristic: without reflection metadata on
-            // the return slot's type, probe whether the pointer's
-            // ClassPrivate slot (offset UOBJ_CLASS) dereferences via
-            // readPtr (SEH-guarded) to a non-null pointer. If so, treat
-            // retVal as a UObject* and wrap it; otherwise fall back to
-            // exposing the raw pointer as lightuserdata.
-            void* retClass = nullptr;
-            if (Engine::readPtr((uint8_t*)retVal + Engine::UOBJ_CLASS, &retClass) && retClass) {
-                pushUObject(L, retVal);
-            } else {
-                lua_pushlightuserdata(L, retVal);
+    // Return value + out-params. Walk the property chain a second time. The
+    // CPF_ReturnParm slot becomes the first Lua return; every CPF_OutParm
+    // (that isn't also CPF_ReturnParm) becomes a subsequent return value in
+    // declaration order. Old behaviour was a blind 8-byte memcpy of the
+    // return slot with a UObject heuristic - that meant every scalar return
+    // and every out-param came back as garbage or nil.
+    int returns = 0;
+    void* outProp = Engine::getChildProperties(fn);
+    while (outProp) {
+        uint64_t pflags = Engine::getPropertyFlags(outProp);
+        bool isReturn = (pflags & Engine::CPF_ReturnParm) != 0;
+        bool isOut = (pflags & Engine::CPF_OutParm) != 0 && !isReturn;
+        if (isReturn || isOut) {
+            int32_t off = Engine::getPropertyOffset(outProp);
+            if (off >= 0 && (uint32_t)off < parmsSize) {
+                PropertyMarshal::readToLua(L, outProp, params + off);
+                returns++;
             }
-        } else {
-            lua_pushnil(L);
         }
-        return 1;
+        outProp = Engine::getNextProperty(outProp);
     }
-
-    return 0;
+    return returns;
 }
 
 // __index: obj.Property or obj:Function
@@ -244,7 +114,35 @@ static int uobject_call_function(lua_State* L) {
 
 static int uobject_isvalid(lua_State* L) {
     UObjectUD* ud = (UObjectUD*)luaL_checkudata(L, 1, UOBJECT_MT);
-    lua_pushboolean(L, ud->ptr != nullptr);
+    if (!ud->ptr) { lua_pushboolean(L, 0); return 1; }
+
+    // Look up the object's slot in GUObjectArray. The pointer-only check
+    // below was a stale-handle bomb: a GC'd actor's pointer is non-null but
+    // dereferencing it crashes. Now we verify the slot still wraps *this*
+    // pointer; GC freeing or recycling the slot makes the slot pointer
+    // differ (or null), and we report invalid.
+    int32_t idx = -1;
+    if (!Engine::readInt32((uint8_t*)ud->ptr + Engine::UOBJ_INDEX, &idx) || idx < 0) {
+        lua_pushboolean(L, 0); return 1;
+    }
+    void* item = Engine::getObjectItemAt(idx);
+    if (!item) { lua_pushboolean(L, 0); return 1; }
+
+    void* slotObj = nullptr;
+    if (!Engine::readPtr((uint8_t*)item + Engine::FUOBJ_OBJECT, &slotObj) ||
+        slotObj != ud->ptr) {
+        lua_pushboolean(L, 0); return 1;
+    }
+
+    // No flag check: EInternalObjectFlags bit positions vary across UE
+    // versions (5.5: Unreachable=1<<28, Garbage=1<<21; older docs have
+    // Native=1<<25 which UClass objects always carry - that bit was the
+    // reason an earlier draft falsely rejected /Script/Engine.* classes).
+    // The slot-pointer match above is sufficient for the common case
+    // (GC freeing or recycling the slot); precise flag-bit discovery is
+    // a Layer-1-style probe deferred until a real GC-edge bug surfaces.
+
+    lua_pushboolean(L, 1);
     return 1;
 }
 
@@ -331,40 +229,11 @@ static int uobject_newindex(lua_State* L) {
         return luaL_error(L, "Property '%s' not found", key);
     }
 
-    const auto& types = Engine::getPropertyTypeNames();
-    uint32_t typeId = Engine::getPropertyTypeNameIndex(prop);
     int32_t offset = Engine::getPropertyOffset(prop);
-    int32_t size = Engine::getPropertyElementSize(prop);
-    uint8_t* data = (uint8_t*)ud->ptr + offset;
-
-    if (typeId == types.intProperty) {
-        int32_t val = (int32_t)luaL_checkinteger(L, 3);
-        memcpy(data, &val, 4);
-    }
-    else if (typeId == types.floatProperty) {
-        float val = (float)luaL_checknumber(L, 3);
-        memcpy(data, &val, 4);
-    }
-    else if (typeId == types.doubleProperty) {
-        double val = luaL_checknumber(L, 3);
-        memcpy(data, &val, 8);
-    }
-    else if (typeId == types.boolProperty) {
-        uint8_t val = lua_toboolean(L, 3) ? 1 : 0;
-        memcpy(data, &val, 1);
-    }
-    else if (typeId == types.byteProperty || typeId == types.int8Property) {
-        int8_t val = (int8_t)luaL_checkinteger(L, 3);
-        memcpy(data, &val, 1);
-    }
-    else if (typeId == types.objectProperty || typeId == types.classProperty) {
-        void* ref = checkUObject(L, 3);
-        memcpy(data, &ref, 8);
-    }
-    else {
+    if (offset < 0) return 0;
+    if (!PropertyMarshal::writeFromLua(L, prop, (uint8_t*)ud->ptr + offset, 3)) {
         return luaL_error(L, "Cannot set property '%s' (unsupported type)", key);
     }
-
     return 0;
 }
 

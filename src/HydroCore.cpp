@@ -1,4 +1,5 @@
 #include "HydroCore.h"
+#include "EngineAPI.h"
 #include <filesystem>
 #include <cstdio>
 #include <cstdarg>
@@ -109,18 +110,19 @@ Core::~Core() {
 
 std::string Core::findGameDirectory() const {
     // Walk up from the DLL's location looking for hydro_mods.json.
+    //
     // Typical UE5 packaged game layout:
     //   GameRoot/
-    //   --- GameName.exe
-    //   --- hydro_mods.json           <-- launcher writes this here
-    //   --- GameName/
-    //       --- Binaries/
-    //           --- Win64/
-    //               --- ue4ss/
-    //                   --- Mods/
-    //                       --- HydroCore/
-    //                           --- dlls/
-    //                               --- main.dll  <-- this DLL
+    //   +-- GameName.exe
+    //   +-- hydro_mods.json           <-- launcher writes this here
+    //   +-- GameName/
+    //       +-- Binaries/
+    //           +-- Win64/
+    //               +-- ue4ss/
+    //                   +-- Mods/
+    //                       +-- HydroCore/
+    //                           +-- dlls/
+    //                               +-- main.dll  <-- this DLL
 
     fs::path dir = getDllDirectory();
 
@@ -253,46 +255,281 @@ void Core::initPakLoader() {
     logInfo("PakLoader init done");
 }
 
+// FNV-1a 32-bit hash of mod_id mapped into [10000, 99999]. MUST stay in sync
+// with `hydro-cli/src/build.rs::stable_chunk_index_for_mod` and the inline
+// computation in `Core::deployPaks` below - change one, change all three.
+static uint32_t stableChunkIndexForMod(const std::string& modId) {
+    uint32_t h = 0x811C9DC5u;
+    for (unsigned char c : modId) {
+        h ^= c;
+        h *= 0x01000193u;
+    }
+    return 10000u + (h % 90000u);
+}
+
+// Locate <Project>/Content/Paks/LogicMods/ relative to the game directory.
+// Same walk-up-five-parents shape as findHydroModsDir below, but read-only -
+// returns "" if not present rather than creating it. Used by AR.bin lookup
+// at runtime (we never want to mkdir from the engine-tick callback).
+static fs::path findExistingLogicModsDir(const std::string& gameDir) {
+    fs::path dir(gameDir);
+    for (int i = 0; i < 5; i++) {
+        fs::path target = dir / "Content" / "Paks" / "LogicMods";
+        std::error_code ec;
+        if (fs::is_directory(target, ec)) return target;
+        fs::path parent = dir.parent_path();
+        if (parent == dir) break;
+        dir = parent;
+    }
+    return {};
+}
+
 void Core::executePakMounts() {
-    // Default behavior: rely on UE's engine-init pak auto-mount (the same path
-    // UE4SS BPModLoader uses). Paks are symlinked into Content/Paks/LogicMods/
-    // by deployPaks() during construction, before engine init, so the engine's
-    // own scan picks them up and indexes them in IoStore alongside base game
-    // content. Runtime mount via FPakPlatformFile::Mount can't replicate this:
-    // on IoStore-shipped games, FPackageStore is fed only by FIoDispatcher's
-    // startup .utoc scan, which is sealed before any runtime mount could fire.
-    // Opt-in HYDRO_RUNTIME_MOUNT=1 keeps the runtime path live for stock-UE
-    // hot-reload experiments and architectural research.
-    {
-        char buf[16] = {};
-        DWORD got = GetEnvironmentVariableA("HYDRO_RUNTIME_MOUNT", buf, sizeof(buf));
-        if (!(got > 0 && buf[0] == '1')) {
-            logInfo("Pak mount: relying on UE startup auto-mount (set HYDRO_RUNTIME_MOUNT=1 to opt into runtime mount)");
-            return;
-        }
-        logInfo("HYDRO_RUNTIME_MOUNT=1 - runtime pak mount active");
+    // UE 5.6 AR-merge bridge - successor to the runtime FPakPlatformFile::Mount
+    // experiments that filled this slot through April-May 2026. Empirical
+    // baseline: same HydroCore.dll runs both DMG@5.5 (sphere mod loads) and
+    // DMG@5.6 (Assets.load returns nil). UE 5.5's engine-startup pak sweep
+    // auto-merged the LogicMods/ pakchunk*.AssetRegistry.bin sidecars into
+    // the live IAssetRegistry; UE 5.6 stopped doing that - packages mount
+    // at the file level but stay invisible to AR / StaticLoadObject.
+    //
+    // Fix: per enabled mod, locate its deployed AR.bin and merge it via
+    // UAssetRegistryImpl::Serialize(FArchive&) - the same entry point Epic's
+    // own GameFeaturePlugin pipeline uses (paired with MountExplicitlyLoadedPlugin
+    // for the file-mount side, which engine startup already handled for us).
+    // The function pointer is resolved on first call by anchor-driven discovery
+    // (EngineAPI::findArSerializeFn - two __FUNCTION__ anchors in the inner
+    // callee chain -> LEA xref -> .pdata -> E8-caller-climb to the outer virtual
+    // -> single SEH-guarded verify call) and persisted in ScanCache so warm
+    // starts skip the scan entirely.
+    //
+    // Idempotency: on hosts where the engine already merged AR (5.5, Palworld
+    // 5.1), Phase 4 will gate this behind a known_asset_path pre-check from
+    // the manifest. Until that lands, we always run the merge - UE's AR
+    // dedupes by ObjectPath internally so a double-merge is wasteful but not
+    // corrupting. Phase 4 turns this from wasteful into elegant.
+    //
+    // Per-launch one-shot: once we've successfully run (or determined we have
+    // nothing to do), m_pakMountsExecuted is set and subsequent calls no-op.
+    // This is what lets us call from on_unreal_init (preferred - hidden in
+    // loading screen) AND from the per-tick callback (fallback if AR singleton
+    // wasn't bound yet at on_unreal_init time).
+    if (m_pakMountsExecuted) return;
+    if (!m_manifest || m_manifest->getModCount() == 0) {
+        m_pakMountsExecuted = true;
+        return;
+    }
+    if (!Engine::isReady()) {
+        // AR singleton not yet bound - try again next tick.
+        return;
     }
 
-    if (!m_pakLoader || !m_pakLoader->isReady()) return;
-    if (!m_manifest) return;
+    // Optional: defer N ticks past engine-ready before invoking the bridge.
+    // Hypothesis: AR has placeholder/uninitialized State entries with
+    // invalid FNames at the moment engine is "ready"; the inner serialize
+    // path crashes when it tries to decode those FNames. Setting
+    // HYDRO_AR_SERIALIZE_DELAY_TICKS=N waits N ticks before running. Use
+    // a generous value (e.g. 60-300) on first probe; if T1 starts passing
+    // after a delay, the timing theory is confirmed.
+    {
+        char delayBuf[16] = {};
+        DWORD delayLen = GetEnvironmentVariableA("HYDRO_AR_SERIALIZE_DELAY_TICKS",
+                                                 delayBuf, sizeof(delayBuf));
+        int delayTicks = 0;
+        if (delayLen > 0 && delayLen < sizeof(delayBuf)) {
+            delayTicks = atoi(delayBuf);
+        }
+        if (delayTicks > 0) {
+            m_pakMountsTickCounter++;
+            if (m_pakMountsTickCounter < delayTicks) {
+                if (m_pakMountsTickCounter == 1 ||
+                    m_pakMountsTickCounter % 30 == 0) {
+                    logInfo("AR.Serialize bridge: deferring (tick %d / %d)",
+                            m_pakMountsTickCounter, delayTicks);
+                }
+                return;  // not yet - try again next tick
+            }
+            logInfo("AR.Serialize bridge: delay reached (tick %d) - "
+                    "running merge now", m_pakMountsTickCounter);
+        }
+    }
+    fs::path logicMods = findExistingLogicModsDir(m_gameDirectory);
+    if (logicMods.empty()) {
+        logWarn("AR.Serialize bridge: no LogicMods/ dir under %s - skipping",
+                m_gameDirectory.c_str());
+        m_pakMountsExecuted = true;
+        return;
+    }
 
-    std::vector<std::tuple<std::string, std::string, int>> paks;
-    int priority = 100;
+    int merged = 0;
+    int missing = 0;
+    int failed = 0;
     for (const auto& mod : m_manifest->getMods()) {
         if (!mod.enabled) continue;
-        for (const auto& file : mod.files)
-            if (file.fileType == "pak")
-                paks.push_back({file.filePath, mod.modId, priority});
-        priority += 10;
-    }
-    if (paks.empty()) return;
+        bool hasPak = false;
+        for (const auto& f : mod.files) if (f.fileType == "pak") { hasPak = true; break; }
+        if (!hasPak) continue;
 
-    auto results = m_pakLoader->mountAll(paks);
-    for (const auto& r : results) {
-        if (r.success) logInfo("Mounted: %s (%s)", r.pakPath.c_str(), r.modId.c_str());
-        else logError("Mount failed: %s - %s", r.modId.c_str(), r.error.c_str());
+        uint32_t chunkIndex = stableChunkIndexForMod(mod.modId);
+        std::string arName =
+            "pakchunk" + std::to_string(chunkIndex) + "-Windows.AssetRegistry.bin";
+        fs::path arPath = logicMods / arName;
+        std::error_code ec;
+        if (!fs::is_regular_file(arPath, ec)) {
+            // Cook may not have produced an AR.bin sidecar (some loose-file
+            // mods don't ship one). Soft-skip.
+            missing++;
+            continue;
+        }
+
+        if (Engine::loadAssetRegistryBin(arPath.wstring().c_str())) {
+            logInfo("AR.Serialize: merged %s for mod %s",
+                    arName.c_str(), mod.modId.c_str());
+            merged++;
+        } else {
+            logWarn("AR.Serialize: FAILED for mod %s (%ls)",
+                    mod.modId.c_str(), arPath.wstring().c_str());
+            failed++;
+        }
     }
-    logInfo("Mounting: %zu/%zu succeeded", m_pakLoader->getMountedCount(), paks.size());
+    logInfo("AR.Serialize bridge done - merged=%d missing=%d failed=%d",
+            merged, missing, failed);
+    m_pakMountsExecuted = true;
+}
+
+void Core::wireArSearchAllAssets() {
+    if (m_arSearchAllAssetsDone) return;
+    if (!Engine::isReady()) return;
+
+    // SearchAllAssets requires the AR impl + GetAssetByObjectPath UFunction
+    // (used as the anchor for the AR interface UClass). Both come from
+    // discoverAssetRegistry, which can fail at boot if AR CDOs are not yet
+    // in GUObjectArray. We don't gate on those directly here - searchAllAssets
+    // logs a warn and returns false; we re-try every tick until it lands.
+    if (!Engine::searchAllAssets(/*bSynchronousSearch=*/true)) {
+        // Will retry next tick - soft fail.
+        return;
+    }
+    m_arSearchAllAssetsDone = true;
+    logInfo("AR.SearchAllAssets fired - mod content should now be indexed");
+}
+
+// HydroPaks watcher - polls <gameDir>/HydroPaks/ for new pak files and
+// mounts them via Engine::mountPakAtRuntime. Off by default; enabled via
+// env var HYDRO_PAKS_WATCH=1. Polls every ~60 ticks (~1 sec at 60 fps).
+//
+// Workflow: a modder (or external tool, or a future launcher feature)
+// drops a `pakchunkN-Windows.pak` triple into HydroPaks/. On the next
+// poll cycle, HydroCore detects the new file, locates its sibling
+// .utoc/.ucas/.AssetRegistry.bin, calls FPakPlatformFile::Mount through
+// the runtime-mount API, and merges the AR sidecar.
+//
+// Already-mounted files are tracked in `m_dropWatchSeen` to avoid double-
+// mount across polls. Files removed and re-added with the same name are
+// re-mounted (set is keyed by filename, not by mtime).
+void Core::pollHydroPaks() {
+    namespace fs = std::filesystem;
+
+    // First call: read env var to decide whether to enable.
+    if (!m_dropWatchInitDone) {
+        m_dropWatchInitDone = true;
+        char buf[8] = {};
+        DWORD len = GetEnvironmentVariableA("HYDRO_PAKS_WATCH", buf, sizeof(buf));
+        if (len > 0 && buf[0] == '1') {
+            m_dropWatchEnabled = true;
+            logInfo("HydroPaks watcher: ENABLED (HYDRO_PAKS_WATCH=1)");
+        }
+    }
+    if (!m_dropWatchEnabled) return;
+
+    // Throttle: poll every ~10 ticks (~6 polls/sec at 60 fps). Each poll
+    // is one folder-mtime stat (fast path) and a tiny set-lookup; cheap.
+    if (++m_dropWatchTickCounter < 10) return;
+    m_dropWatchTickCounter = 0;
+
+    // Locate the drop folder. Walk up from m_gameDirectory until we find
+    // a "HydroPaks/" sibling/ancestor.
+    if (m_gameDirectory.empty()) {
+        static bool s_warnedNoGameDir = false;
+        if (!s_warnedNoGameDir) {
+            s_warnedNoGameDir = true;
+            logWarn("HydroPaks watcher: m_gameDirectory empty - no walkup possible");
+        }
+        return;
+    }
+    fs::path dir(m_gameDirectory);
+    fs::path dropDir;
+    for (int i = 0; i < 6; i++) {
+        fs::path candidate = dir / "HydroPaks";
+        if (fs::is_directory(candidate)) { dropDir = candidate; break; }
+        fs::path parent = dir.parent_path();
+        if (parent == dir) break;
+        dir = parent;
+    }
+    static bool s_loggedDropPath = false;
+    if (!s_loggedDropPath) {
+        s_loggedDropPath = true;
+        if (dropDir.empty()) {
+            logWarn("HydroPaks watcher: no 'HydroPaks' folder found in 6-level walk-up "
+                    "from m_gameDirectory='%s'", m_gameDirectory.c_str());
+        } else {
+            logInfo("HydroPaks watcher: watching %s", dropDir.string().c_str());
+        }
+    }
+    if (dropDir.empty()) return;
+
+    // Heartbeat once per ~minute so we can tell the watcher is alive.
+    static int s_heartbeatCount = 0;
+    if (++s_heartbeatCount % 360 == 0) {
+        logInfo("HydroPaks watcher: alive (poll #%d, mounted=%zu)",
+                s_heartbeatCount, m_dropWatchSeen.size());
+    }
+
+    // Fast path: stat the folder's last_write_time. If it hasn't changed
+    // since our previous poll, skip the directory_iterator (Windows
+    // updates folder mtime when files are added/removed/renamed inside;
+    // this is one cheap stat call vs walking every file).
+    std::error_code mec;
+    auto ft = fs::last_write_time(dropDir, mec);
+    if (!mec) {
+        int64_t mt = ft.time_since_epoch().count();
+        if (mt == m_dropWatchLastMtime) return;
+        m_dropWatchLastMtime = mt;
+    }
+    // (If stat failed, fall through to full scan - better than missing
+    // the file altogether.)
+
+    // Scan for *.pak; skip ones we've already mounted this session.
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(dropDir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()) continue;
+        const fs::path& p = entry.path();
+        if (p.extension() != ".pak") continue;
+
+        std::string fname = p.filename().string();
+        if (m_dropWatchSeen.count(fname)) continue;
+
+        // Locate sibling .AssetRegistry.bin (optional).
+        fs::path arBin = p; arBin.replace_extension("AssetRegistry.bin");
+        bool hasAr = fs::is_regular_file(arBin);
+
+        std::wstring wpak  = p.wstring();
+        std::wstring war   = hasAr ? arBin.wstring() : std::wstring();
+
+        logInfo("HydroPaks watcher: detected '%s' (AR.bin=%s) - mounting",
+                fname.c_str(), hasAr ? "yes" : "no");
+        bool ok = Engine::mountPakAtRuntime(
+            wpak.c_str(),
+            war.empty() ? nullptr : war.c_str(),
+            /*priority=*/1000);
+        logInfo("HydroPaks watcher: mount '%s' -> %s", fname.c_str(),
+                ok ? "OK" : "FAIL");
+        // Only mark as seen on success. If mount fails (typically because
+        // FPakPlatformFile reverse-discovery hasn't completed yet), retry
+        // on the next poll cycle.
+        if (ok) m_dropWatchSeen.insert(fname);
+    }
 }
 
 // Pak deployment - symlink mods into Content/Paks/LogicMods/
@@ -301,6 +538,7 @@ namespace {
 
 // Returns the game's `<Project>/Content/Paks/LogicMods/` path, creating it
 // if missing. Empty string on failure.
+//
 // `gameDir` is the location of `hydro_mods.json` - typically
 // `<game>/<Project>/Binaries/Win64/`, NOT the project root. So we walk
 // UP looking for `Content/Paks/` (same pattern as PakLoader uses).
@@ -321,7 +559,10 @@ fs::path findHydroModsDir(const std::string& gameDir) {
     return {};
 }
 
-// File symlinks on Windows need SeCreateSymbolicLinkPrivilege; just copy.
+// Copy a pak file into the deploy target. File symlinks on Windows need
+// SeCreateSymbolicLinkPrivilege, which regular users don't have, so we
+// just copy. Pak triples are <= ~16 MB and source/dest share a volume.
+// Returns "copy" on success, "" on failure.
 const char* linkOrCopy(const fs::path& src, const fs::path& dst) {
     std::error_code cec;
     fs::copy_file(src, dst, fs::copy_options::overwrite_existing, cec);
@@ -335,8 +576,12 @@ bool Core::cleanupDeployedPaks() {
     fs::path logicMods = findHydroModsDir(m_gameDirectory);
     if (logicMods.empty()) return false;
 
-    // Walk both LogicMods/ and legacy HydroMods/. Stale paks in HydroMods/
-    // still get auto-mounted by UE and collide with fresh pakchunk paks.
+    // Walk both LogicMods/ (current target) and HydroMods/ (legacy target
+    // from the pre-chunked-shader-library era). UE auto-mounts any pak
+    // under Content/Paks/** regardless of subdir, so a stale Hydro_* triple
+    // in HydroMods/ collides with a fresh pakchunk<N>-Windows.* in
+    // LogicMods/ at AssetRegistry merge time and trips a TArray-bounds
+    // fatal in ContainerHelpers.cpp.
     fs::path paksRoot = logicMods.parent_path();
     fs::path legacyDirs[] = { logicMods, paksRoot / "HydroMods" };
 
@@ -350,8 +595,10 @@ bool Core::cleanupDeployedPaks() {
             // Match three shapes:
             //   1. legacy `Hydro_*` (pre-chunked-shader-library era)
             //   2. transient `pakchunk<N>-Hydro_*` (one-day intermediate)
-            //   3. current `pakchunk<N>-Windows.<ext>` where N is in [10000,99999]
-            //      (our reserved chunk-index range from the FNV-1a mod_id hash).
+            //   3. current `pakchunk<N>-Windows.<ext>` where N ∈ [10000,99999]
+            //      - our reserved chunk-index range from the FNV-1a mod_id hash.
+            //      Host-shipped paks use small N (typically 0..few-hundred);
+            //      our high range avoids collision with host content.
             bool isOurs = (name.rfind("Hydro_", 0) == 0) ||
                           (name.find("-Hydro_") != std::string::npos);
             if (!isOurs && name.rfind("pakchunk", 0) == 0) {
@@ -379,6 +626,17 @@ bool Core::deployPaks() {
         logWarn("Pak deploy skipped - no game directory");
         return false;
     }
+    // Manual-test gate: HYDRO_SKIP_DEPLOY=1 disables LogicMods/ deploy so a
+    // hand-staged plugin tree under <game>/Plugins/<Mod>/ can be tested in
+    // isolation. Also runs cleanupDeployedPaks() so any prior deploy is
+    // removed before launch.
+    char skipBuf[8] = {};
+    DWORD skipLen = GetEnvironmentVariableA("HYDRO_SKIP_DEPLOY", skipBuf, sizeof(skipBuf));
+    if (skipLen > 0 && skipLen < sizeof(skipBuf) && skipBuf[0] == '1') {
+        logWarn("Pak deploy skipped (HYDRO_SKIP_DEPLOY=1) - running cleanup only");
+        cleanupDeployedPaks();
+        return false;
+    }
 
     fs::path target = findHydroModsDir(m_gameDirectory);
     if (target.empty()) {
@@ -402,14 +660,16 @@ bool Core::deployPaks() {
             }
             std::string baseStem = pakSrc.stem().string();
 
-            // Deploy the .pak plus its IoStore companions (.utoc, .ucas).
-            // UE 5.x materials only render correctly when all three are
-            // co-mounted at engine init - runtime pak mounting can't
-            // register shader-library chunks with the renderer's
-            // already-initialized shader library.
+            // Deploy the .pak plus its IoStore companions (.utoc, .ucas)
+            // plus the cook's .AssetRegistry.bin sibling - UE 5.6's
+            // AssetRegistry merge needs this on startup-mount to know what
+            // packages live in the chunk. Without it the pak mounts but
+            // GetAsset queries return null because AR has no entries for
+            // /Game/Mods/<modName>/*.
+            //
             // The `_P` suffix is UE's "patch" marker - bumps load priority
             // so our content overrides anything the game's own pak baked.
-            for (const char* ext : {"pak", "utoc", "ucas"}) {
+            for (const char* ext : {"pak", "utoc", "ucas", "AssetRegistry.bin"}) {
                 fs::path sibling = pakSrc;
                 sibling.replace_extension(ext);
                 if (!fs::exists(sibling)) continue;
@@ -418,16 +678,7 @@ bool Core::deployPaks() {
                 // parses N as the pak's chunk index. UE then uses that index in
                 // GetShaderLibraryNameForChunk("<HostProject>", N) -> "<HostProject>_Chunk<N>",
                 // which matches the in-pak shader archive name written by hydro-cli.
-                // N is a deterministic FNV-1a 32-bit hash of mod.modId mapped into
-                // [10000, 99999]. Same algorithm in `hydro-cli/src/build.rs::
-                // stable_chunk_index_for_mod` - both sides MUST stay in sync; if
-                // you change one, change both.
-                uint32_t chunkIndex = 0x811C9DC5u;
-                for (unsigned char c : mod.modId) {
-                    chunkIndex ^= c;
-                    chunkIndex *= 0x01000193u;
-                }
-                chunkIndex = 10000u + (chunkIndex % 90000u);
+                uint32_t chunkIndex = stableChunkIndexForMod(mod.modId);
 
                 std::string destName =
                     "pakchunk" + std::to_string(chunkIndex) + "-Windows." + std::string(ext);

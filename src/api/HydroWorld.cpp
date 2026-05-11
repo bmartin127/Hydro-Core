@@ -9,7 +9,7 @@
 ///   - Finding creatures? Use Hydro.SN2.Creatures.getAll() instead.
 ///   - Querying game state? Use the appropriate game-specific module.
 ///   Generic API is for novel mechanics, debugging, and cases not yet
-///   covered by specific registries.
+///   covered by specific registries. See CONTRIBUTING_TIER2.md.
 ///
 /// @depends EngineAPI (GUObjectArray, StaticFindObject, UWorld)
 /// @engine_systems GUObjectArray, UWorld
@@ -150,6 +150,7 @@ static int l_world_getGameplayStatics(lua_State* L) {
 }
 
 // World.getPlayer / getPlayerPawn / findAllOfClass
+//
 // These route through UE's own UGameplayStatics functions instead of
 // scanning GUObjectArray. They're the preferred way to find the player
 // and iterate typed actors - faster AND more stable across engine
@@ -173,6 +174,40 @@ static int l_world_getPlayer(lua_State* L) {
 static int l_world_getPlayerPawn(lua_State* L) {
     int index = (int)luaL_optinteger(L, 1, 0);
     Lua::pushUObject(L, Engine::getPlayerPawn(index));
+    return 1;
+}
+
+/// Read an actor's world location via the reflected
+/// `K2_GetActorLocation` UFunction. Returns a `{x, y, z}` Lua table or
+/// `nil` if the actor or its function can't be resolved.
+///
+/// UE 5 uses double-precision FVector (LWC), so the underlying call
+/// returns 3 doubles. We push them as Lua numbers (also doubles).
+///
+/// @param actor UObject - The actor to query
+/// @returns table - {x = number, y = number, z = number} or nil
+/// @example
+/// local pawn = Hydro.World.getPlayerPawn()
+/// local loc = Hydro.World.getActorLocation(pawn)
+/// if loc then print(loc.x, loc.y, loc.z) end
+static int l_world_getActorLocation(lua_State* L) {
+    void* actor = Lua::checkUObject(L, 1);
+    if (!actor) { lua_pushnil(L); return 1; }
+    void* actorClass = Engine::getClass(actor);
+    if (!actorClass) { lua_pushnil(L); return 1; }
+    void* func = Engine::findFunction(actorClass, L"K2_GetActorLocation");
+    if (!func) { lua_pushnil(L); return 1; }
+
+    // FVector in UE 5.x = 3 doubles (large-world coordinates).
+    struct { double X, Y, Z; } params{ 0.0, 0.0, 0.0 };
+    if (!Engine::callFunction(actor, func, &params)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_createtable(L, 0, 3);
+    lua_pushnumber(L, params.X); lua_setfield(L, -2, "x");
+    lua_pushnumber(L, params.Y); lua_setfield(L, -2, "y");
+    lua_pushnumber(L, params.Z); lua_setfield(L, -2, "z");
     return 1;
 }
 
@@ -216,6 +251,7 @@ static const luaL_Reg world_functions[] = {
     {"getGameplayStatics",  l_world_getGameplayStatics},
     {"getPlayer",           l_world_getPlayer},
     {"getPlayerPawn",       l_world_getPlayerPawn},
+    {"getActorLocation",    l_world_getActorLocation},
     {"findAllOfClass",      l_world_findAllOfClass},
     {nullptr,               nullptr}
 };

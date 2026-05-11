@@ -1,8 +1,25 @@
+///
 /// @module Hydro.Events
-/// @description Hook any UFunction; callback fires on each call with the target object.
-/// Installs inline detours on both ProcessEvent and ProcessInternal (some BP events
-/// enter via ProcessInternal directly). No UFunction struct is mutated.
+/// @description Hook into engine events and UFunction calls.
+///   Register callbacks on any UFunction. When the engine calls that
+///   function, your Lua callback fires with the target object.
+///
+///   Two x64 inline detours are installed into the engine's function
+///   dispatch pipeline: one on UObject::ProcessEvent and one on
+///   UObject::ProcessInternal. Some Blueprint event dispatch paths
+///   (including generated C++ stubs for BlueprintImplementableEvent
+///   events like ReceiveBeginPlay) enter via ProcessInternal rather
+///   than the outer ProcessEvent, so we have to catch both to hook
+///   actor lifecycle events reliably. No UFunction struct is mutated,
+///   so the base Actor's BeginPlay dispatch stays intact and character
+///   animation blueprints keep working.
+///
+///   For game-specific events, prefer dedicated Tier 2 modules.
+///   See CONTRIBUTING_TIER2.md.
+///
 /// @depends EngineAPI (ProcessEvent address, findObject, UFUNC_FUNC)
+/// @engine_systems UObject::ProcessEvent, UObject::ProcessInternal
+///
 
 #include "HydroEvents.h"
 #include "ModuleRegistry.h"
@@ -37,7 +54,16 @@ extern "C" {
 
 namespace Hydro::API {
 
-// Hook registry: keyed by FName index so subclass overrides with the same name are caught.
+// Hook registry
+//
+// Hooks are keyed by the FName index of the UFunction's name, not by its
+// UFunction* pointer. This matters because Blueprint subclasses generate
+// their own per-class override UFunctions - e.g., hooking
+// "/Script/Engine.Actor:ReceiveBeginPlay" should also fire when a BP
+// subclass's own ReceiveBeginPlay override runs. Matching by pointer
+// would miss every subclass override. Matching by FName index catches
+// all of them: every UFunction with the name "ReceiveBeginPlay", no
+// matter which class owns it.
 
 struct HookCallback {
     lua_State* L;
@@ -58,8 +84,18 @@ static std::unordered_map<uint32_t, HookedName> s_hooks;
 static std::mutex s_hooksMutex;
 static bool s_hookInstalled = false;
 
-// Trace listener registry: logs all PE/PI/BP calls on a UObject for N seconds.
-// Piggybacks on the existing detours (no second inline patch).
+// Trace listener registry
+//
+// A trace logs every PE/PI/BP call on a single target UObject for a fixed
+// number of seconds. Used by Hydro.Reflect.trace() to build live event
+// sequence recordings that Slice 3's scaffolder feeds into module
+// templates (e.g., "when a creature spawns, these events fire in this
+// order").
+//
+// Piggybacks on the existing inline hook detours - does NOT install a
+// second inline prologue patch (two inline hooks on the same function
+// don't compose cleanly). Each detour checks s_traces.empty() as a fast
+// path before taking the trace mutex.
 
 struct TraceListener {
     void* target;               // UObject instance being watched
@@ -70,9 +106,14 @@ struct TraceListener {
     uint64_t startTickCount;    // for relative timestamps in the output
 };
 
-static std::vector<std::unique_ptr<TraceListener>> s_traces; // unique_ptr: ofstream is non-copyable
+// std::vector so empty() is one load and iteration is pointer-walk friendly.
+// Use unique_ptr because TraceListener has a non-copyable std::ofstream.
+static std::vector<std::unique_ptr<TraceListener>> s_traces;
 static std::mutex s_tracesMutex;
-static uint64_t s_tickCounter = 0; // incremented per tickTraces(); used for trace timestamps + expiry
+// Monotonic counter incremented once per tickTraces() call. Not a true game
+// tick - it's "how many post-tick callbacks have fired since DLL load."
+// Used as a relative timestamp in trace output and for expiring listeners.
+static uint64_t s_tickCounter = 0;
 
 // FName index is stored at the UObjectBase::NamePrivate field. On UE5.5
 // that's offset 0x18 from the UObject base for a ComparisonIndex (uint32).
@@ -85,7 +126,13 @@ static uint32_t readNameIdx(void* ufunc) {
     return idx;
 }
 
-// Inline hook state: PE (outer dispatch) + PI (BP VM entry). Both share the same hook map.
+// Inline hook state
+//
+// We install two separate inline hooks: one on ProcessEvent (outer dispatch
+// entry point for script calls), and one on ProcessInternal (the inner VM
+// entry point that BP events sometimes bypass straight to). Both detours
+// share the same hook map - each one reads the UFunction from its argument
+// frame and looks up matching hooks by FName index.
 
 using ProcessEventFn = void(__fastcall*)(void*, void*, void*);
 using ProcessInternalFn = void(__fastcall*)(void*, void*, void*);
@@ -98,13 +145,26 @@ static bool s_peHooked = false;
 static bool s_piHooked = false;
 static bool s_bpHooked = false;
 
-// Cached so the BeginPlay vtable-hook detour can fire hooks by the same FName index mods registered.
+// Cached ReceiveBeginPlay UFunction so the BeginPlay vtable-hook detour
+// can synthesize a fireHooksForFunction call using the same FName index
+// that mods registered via Events.hook("/Script/Engine.Actor:ReceiveBeginPlay").
 static void* s_receiveBeginPlayFunc = nullptr;
 
-constexpr int FFRAME_NODE_OFFSET = 0x10; // FFrame::Node (UFunction*) in ProcessInternal frame
+// FFrame::Node offset - the UFunction pointer embedded in the execution
+// frame passed to ProcessInternal. UE5.5 layout.
+constexpr int FFRAME_NODE_OFFSET = 0x10;
 
-// Decode and relocate at least minBytes of prologue from src to dst using Zydis,
-// fixing up rip-relative displacements. Returns bytes consumed, or 0 on failure.
+// Minimal x64 length decoder
+
+// Decode and relocate a function prologue using Zydis. Copies instructions
+// from `src` to `dst` one at a time until at least `minBytes` have been
+// consumed, fixing up rip-relative displacements so the copied code runs
+// correctly from its new location. Returns bytes consumed from `src`, or
+// 0 on failure (undecodable, rip-relative beyond +/-2GB, etc.).
+//
+// This replaces the hand-rolled opcode table that only handled ~10 opcodes.
+// Zydis decodes the full x86-64 ISA, so prologues using any valid
+// instruction (including calls, jumps, rip-relative loads) work.
 static int relocatePrologue(const uint8_t* src, uint8_t* dst, int minBytes) {
     ZydisDecoder decoder;
     if (ZYAN_FAILED(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
@@ -130,11 +190,18 @@ static int relocatePrologue(const uint8_t* src, uint8_t* dst, int minBytes) {
             return 0;
         }
 
+        // Copy the raw bytes. Fixup happens after, in-place.
         memcpy(dst + pos, src + pos, inst.length);
 
+        // If this instruction has a rip-relative operand (disp or imm), the
+        // value in the encoded bytes is an offset from the instruction's
+        // *original* end address. When we relocate to `dst`, the target
+        // address needs the same end address, so we adjust the displacement
+        // by the difference between old and new instruction positions.
         if (inst.attributes & ZYDIS_ATTRIB_IS_RELATIVE) {
-            int64_t shift = (int64_t)src - (int64_t)dst;
+            int64_t shift = (int64_t)src - (int64_t)dst;  // constant per-call; shift>0 if dst is earlier
 
+            // Displacement (e.g. MOV rax, [rip+disp32])
             if (inst.raw.disp.size > 0) {
                 int64_t newDisp = (int64_t)inst.raw.disp.value + shift;
                 if (inst.raw.disp.size == 32) {
@@ -147,12 +214,14 @@ static int relocatePrologue(const uint8_t* src, uint8_t* dst, int minBytes) {
                     int32_t v = (int32_t)newDisp;
                     memcpy(dst + pos + inst.raw.disp.offset, &v, 4);
                 } else {
+                    // 8/16-bit displacements can't span the trampoline distance.
                     logError("[Hydro.Events] rip-relative %u-bit disp not supported at +%d",
                              inst.raw.disp.size, pos);
                     return 0;
                 }
             }
 
+            // Immediate (e.g. E8 call rel32, E9 jmp rel32, Jcc rel8/32)
             if (inst.raw.imm[0].is_relative && inst.raw.imm[0].size > 0) {
                 int64_t newImm = inst.raw.imm[0].value.s + shift;
                 if (inst.raw.imm[0].size == 32) {
@@ -165,6 +234,8 @@ static int relocatePrologue(const uint8_t* src, uint8_t* dst, int minBytes) {
                     int32_t v = (int32_t)newImm;
                     memcpy(dst + pos + inst.raw.imm[0].offset, &v, 4);
                 } else {
+                    // A short conditional jump (rel8) in a prologue would need
+                    // promotion to rel32 - out of scope for now.
                     logError("[Hydro.Events] relative imm%u-bit not supported at +%d",
                              inst.raw.imm[0].size, pos);
                     return 0;
@@ -208,15 +279,21 @@ static void* resolveJmpTrampoline(void* addr, int depth = 0) {
     return addr;
 }
 
-// Install a 14-byte absolute jmp detour at target. Allocates a trampoline with
-// the original prologue + jmp-back. Returns the trampoline or nullptr on failure.
+// Core inline-hook installer. Target gets a 14-byte absolute jmp to the
+// detour; an executable trampoline is allocated that runs the original
+// prologue bytes and jumps back to target+N. Returns the trampoline
+// pointer on success, nullptr on failure.
 static void* installInlineHookAt(void* target, void* detour, const char* label) {
     if (!target) {
         logError("[Hydro.Events] %s address not available", label);
         return nullptr;
     }
 
-    // Resolve E9/FF25 thunks before hooking (copying a jmp into a trampoline breaks rip-relative refs).
+    // Follow simple thunks. MSVC sometimes emits the function entry as a
+    // jmp to the real implementation (especially when /INCREMENTAL is on or
+    // for imported symbols). Copying a jmp with rip-relative addressing
+    // into a trampoline would break the relative reference, so resolve it
+    // to the real target address and hook THAT instead.
     const uint8_t* bytes = (const uint8_t*)target;
     for (int iterations = 0; iterations < 4; iterations++) {
         if (bytes[0] == 0xE9) {
@@ -241,13 +318,24 @@ static void* installInlineHookAt(void* target, void* detour, const char* label) 
         break;
     }
 
-    // Trampoline must be within ±2GB of target so rip-relative disp32 fixups don't overflow.
-    const size_t trampolineSize = 64 + 14;  // prologue copy + 14-byte jmp-back
+    // Pre-allocate a trampoline of generous size. We decode instructions
+    // *into* the trampoline (via relocatePrologue) so rip-relative fixups
+    // can land directly in the final executable location - this matters
+    // because the fixup math uses the trampoline's address as the new PC.
+    //
+    // The trampoline MUST land within +/-2GB of `target`: prologue bytes may
+    // contain rip-relative instructions whose disp32/imm32 fields would
+    // otherwise overflow when relocated. VirtualAlloc's default placement
+    // picks arbitrary high addresses far outside that range.
+    const size_t trampolineSize = 64 + 14;  // 64 bytes for prologue + 14 for jmp-back
     uint8_t* tramp = nullptr;
     {
         uintptr_t t = (uintptr_t)target;
-        const uintptr_t kGranularity = 0x10000;
-        const uintptr_t kMaxSearch = (uintptr_t)0x70000000;
+        const uintptr_t kGranularity = 0x10000;  // 64KB, Windows alloc granularity
+        const uintptr_t kMaxSearch = (uintptr_t)0x70000000;  // ~1.75GB - safely inside +/-2GB
+        // Probe addresses just below `target` first, then just above. Most
+        // game modules map in the low half of the 64-bit address space, so
+        // searching downward usually hits free regions quickly.
         for (uintptr_t offset = kGranularity; offset < kMaxSearch && !tramp; offset += kGranularity) {
             if (t > offset) {
                 tramp = (uint8_t*)VirtualAlloc((void*)(t - offset), trampolineSize,
@@ -260,7 +348,10 @@ static void* installInlineHookAt(void* target, void* detour, const char* label) 
         }
     }
     if (!tramp) {
-        // Fallback: any address. relocatePrologue will still reject rip-relative overflow.
+        // Fallback: any address. Zydis will refuse to install if it needs
+        // to copy rip-relative bytes that can't be fixed up from this
+        // location, so behavior stays safe - we just lose the ability to
+        // hook a few functions that would have worked with a nearby tramp.
         tramp = (uint8_t*)VirtualAlloc(
             nullptr, trampolineSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     }
@@ -312,6 +403,7 @@ static void* installInlineHookAt(void* target, void* detour, const char* label) 
 }
 
 // Discover ProcessInternal via UE4SS's ExecuteUbergraph trick.
+//
 // ProcessInternal isn't exposed via a vtable entry we can pattern-match
 // easily. But every UFunction has a `Func` native pointer at offset 0xD8,
 // and the `/Script/CoreUObject.Object:ExecuteUbergraph` UFunction's Func
@@ -337,6 +429,7 @@ static void* discoverProcessInternal() {
 // Hook AActor::BeginPlay via vtable swap. BeginPlay is a C++ virtual
 // that the engine calls directly (no ProcessEvent). The vtable offset
 // is 0x3A0 on UE 5.5 - we probe a small window around it.
+//
 // We use a vtable swap (replacing the pointer in the vtable) rather
 // than an inline hook (patching the function's first bytes) because
 // UE4SS may have already inline-hooked BeginPlay. Two inline hooks
@@ -348,10 +441,12 @@ static void __fastcall hydroBeginPlayDetour(void* actor);
 static bool installBeginPlayVtableSwap() {
     // Name is historical - we don't patch vtables, we inline-hook the
     // function pointer stored at AActor's CDO vtable slot 0x3A0 (UE 5.5).
+    //
     // This is the same technique UE4SS uses (resolve via Default__Actor
     // CDO, follow jmp thunks, inline-hook the resolved address) and what
     // every mature UE5 mod loader converges on: Palworld, Hogwarts, Ark
     // Ascended, Satisfactory community tooling all target this exact path.
+    //
     // Why it catches BP actors even though AActor::BeginPlay is virtual:
     //   BP_ThirdPersonCharacter::BeginPlay -> Super -> ACharacter::BeginPlay
     //   -> Super -> APawn::BeginPlay -> Super -> AActor::BeginPlay (HOOK HERE)
@@ -359,10 +454,12 @@ static bool installBeginPlayVtableSwap() {
     // Only AActor::BeginPlay calls ReceiveBeginPlay, so every well-behaved
     // actor chain reaches our hook. Subclasses that override BeginPlay
     // without calling Super are the one legal-but-rare pattern we miss.
+    //
     // Resolving off the AActor CDO (not any subclass) is essential:
     // BP_ThirdPersonCharacter's vtable slot may contain ACharacter::BeginPlay,
     // but AActor's own CDO vtable gives us AActor's implementation - the
     // one every Super::BeginPlay() chain lands on.
+    //
     // Our earlier attempts failed silently because the hand-rolled prologue
     // decoder couldn't handle a `0xE8 call rel32` 13 bytes into BeginPlay's
     // body and fell back to vtable offset 0x3A8 (a different, unrelated
@@ -467,6 +564,7 @@ static bool installInlineHook() {
 // Trace dispatch: iterate active traces, write a JSONL line for each
 // entry whose target matches `obj`. Fast-path exits on empty list so
 // the common case (no active traces) is a single load+branch.
+//
 // Called from all three detours (PE, PI, BP) after the hook dispatch.
 // The `src` tag lets us distinguish PE/PI/BP in the trace output so
 // tools downstream can reason about which dispatch path fired.
@@ -627,6 +725,7 @@ static void fireHooksForFunction(const char* source, void* obj, void* func) {
     // time we see it. Proves the detour is actually being called and
     // shows which function names flow through - useful for diagnosing
     // "my hook never fires" issues (wrong nameIdx, wrong detour path).
+    //
     // Writes to a dedicated HydroEvents-diag.log with flush-per-write so
     // the data survives hard game termination. The main UE4SS log buffers
     // and loses anything in-flight when the game is killed or crashes.
@@ -898,11 +997,13 @@ static int l_events_hook(lua_State* L) {
     return 1;
 }
 
-// --- Coroutine scheduler (for wait()) ---
+// --- Coroutine scheduler (for wait()) ----------------------------------
+//
 // Top-level mod scripts run inside a Lua coroutine so they can call
 // `wait(seconds)` to yield. The coroutine's state is kept alive via a
 // registry ref; the scheduler resumes it when its wake time is due.
 // Same PE-detour pump as periodics.
+//
 // `wait()` is a global: `wait(1.5)` inside any mod script yields the
 // calling coroutine for 1.5 seconds. Scripts that never call wait just
 // run to completion on their first resume with no additional cost.

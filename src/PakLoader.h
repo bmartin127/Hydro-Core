@@ -25,6 +25,15 @@ public:
     /// Find singleton + Mount function. Call from any thread.
     bool initialize();
 
+    /// Alternative initializer: skip the L"PakFile"-anchor singleton scan
+    /// (which picks a wrong vtable on UE 5.6 DMG and finds 0 instance
+    /// candidates) and seed the instance externally - typically from
+    /// EngineAPI's reverse-discovery via the FFilePackageStoreBackend
+    /// pointer (which it locates inside FPackageStore.Backends[0]). The
+    /// instance's first qword is read as the real vtable. Mount fn is
+    /// still resolved via the L"utoc not found" anchor.
+    bool initializeWithInstance(void* fpakPlatformFile);
+
     /// Mount a pak file. MUST be called from game thread.
     PakMountResult mountPak(const std::string& pakPath, const std::string& modId, int priority);
 

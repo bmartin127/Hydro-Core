@@ -68,6 +68,50 @@ static std::string getPropertyTypeName(void* prop) {
     return Engine::getNameString(typeIdx);
 }
 
+// Emit the rich type description for a single FProperty as JSON. Always
+// writes `"type": "<TypeName>"`, optionally followed by an inner-name field
+// (`"structName"` / `"className"` / `"enumName"`) or a recursive `"inner"`
+// object for ArrayProperty. The caller is responsible for the surrounding
+// braces and any leading comma - this writer only emits keys, no wrapping.
+//
+// Schema v2 (since 2026-05-06). Old consumers still parse v1 dumps cleanly
+// because the new fields are all optional.
+static void writePropertyTypeJson(std::ostream& out, void* prop) {
+    std::string typeName = getPropertyTypeName(prop);
+    out << "\"type\": "; writeJsonString(out, typeName);
+    if (typeName == "StructProperty") {
+        if (void* s = Engine::getStructStruct(prop)) {
+            out << ", \"structName\": ";
+            writeJsonString(out, Engine::getObjectName(s));
+        }
+    } else if (typeName == "ObjectProperty"
+            || typeName == "ClassProperty"
+            || typeName == "WeakObjectProperty"
+            || typeName == "SoftObjectProperty"
+            || typeName == "SoftClassProperty") {
+        if (void* c = Engine::getObjectPropertyClass(prop)) {
+            out << ", \"className\": ";
+            writeJsonString(out, Engine::getObjectName(c));
+        }
+    } else if (typeName == "EnumProperty") {
+        if (void* e = Engine::getEnumPropertyEnum(prop)) {
+            out << ", \"enumName\": ";
+            writeJsonString(out, Engine::getObjectName(e));
+        }
+    } else if (typeName == "ByteProperty") {
+        if (void* e = Engine::getBytePropertyEnum(prop)) {
+            out << ", \"enumName\": ";
+            writeJsonString(out, Engine::getObjectName(e));
+        }
+    } else if (typeName == "ArrayProperty") {
+        if (void* inner = Engine::getArrayInner(prop)) {
+            out << ", \"inner\": {";
+            writePropertyTypeJson(out, inner);
+            out << "}";
+        }
+    }
+}
+
 // Build a flags string like "Parm|ReturnParm|OutParm"
 static std::string formatPropertyFlags(uint64_t flags) {
     std::string s;
@@ -179,13 +223,20 @@ static void writeFunctionFlagsJsonArray(std::ostream& out, uint32_t flags) {
     out << ']';
 }
 
-// Class cache: rebuilt when object count grows by >500 (catches map transitions without constant rebuilds).
+// Cached class set - built on first findClass call, rebuilt when the live
+// object count has grown enough to suggest new classes were loaded (e.g.,
+// after a map load or blueprint asset stream-in). Threshold is coarse -
+// we rebuild only when >500 new objects appeared, which dwarfs the cost
+// of individual class-load events but catches map transitions reliably.
 static std::unordered_map<void*, std::string> s_classCache;
 static bool s_classCacheBuilt = false;
 static int32_t s_classCacheObjCount = 0;   // total at last build
 
 static void buildClassCache() {
     int32_t total = Engine::getObjectCount();
+    // Rebuild if we've never built, or if the world has grown significantly.
+    // Objects can also be destroyed (count drops), but destroyed classes are
+    // rare - the cache merely becomes slightly over-broad, not incorrect.
     if (s_classCacheBuilt && total <= s_classCacheObjCount + 500) return;
     if (s_classCacheBuilt) {
         Hydro::logInfo("[Hydro.Reflect] Class cache rebuild: %d -> %d objects (+%d)",
@@ -193,7 +244,7 @@ static void buildClassCache() {
         s_classCache.clear();
     }
 
-    // Collect unique class pointers from all live objects
+    // Phase 1: collect unique class pointers from all live objects
     std::unordered_set<void*> classSet;
     for (int32_t i = 0; i < total; i++) {
         void* obj = Engine::getObjectAt(i);
@@ -231,6 +282,7 @@ static void buildClassCache() {
 }
 
 // findClass(query) -> array of { name }
+//
 // Enumerates classes by collecting unique ClassPrivate pointers from every
 // object in GUObjectArray. Class set is cached after first call.
 // Filters by case-insensitive substring match on the class name.
@@ -277,6 +329,7 @@ static int l_functions(lua_State* L) {
     // Children field (at the same offset as ChildProperties for UStruct)
     // holds UField children which includes UFunctions. We use the existing
     // findFunction infrastructure but iterate instead of searching by name.
+    //
     // UStruct::Children is at offset 0x48 (after SuperStruct at 0x40).
     // Each child is a UField with a Next pointer at offset 0x28.
     constexpr int CHILDREN_OFFSET = 0x48;
@@ -508,6 +561,7 @@ static int l_assets(lua_State* L) {
 }
 
 // dump(outputDir) -> { classes, files }
+//
 // Full reflection dump. With FNamePool direct reading, name resolution is
 // just memory reads - no ProcessEvent calls. The entire dump of ~10k classes
 // completes in under a second with no game stutter.
@@ -540,7 +594,7 @@ static std::string classPathToRelPath(const std::string& classPath) {
 static void writeClassJson(std::ostream& out, void* cls, const std::string& className,
                             const std::string& classPath, uint32_t functionNameIdx) {
     out << "{\n";
-    out << "  \"schemaVersion\": 1,\n";
+    out << "  \"schemaVersion\": 2,\n";
     out << "  \"kind\": \"class\",\n";
     out << "  \"name\": "; writeJsonString(out, className); out << ",\n";
     out << "  \"path\": "; writeJsonString(out, classPath); out << ",\n";
@@ -600,7 +654,8 @@ static void writeClassJson(std::ostream& out, void* cls, const std::string& clas
             if (!first) out << ",";
             out << "\n    {";
             out << "\"name\": "; writeJsonString(out, pName);
-            out << ", \"type\": "; writeJsonString(out, getPropertyTypeName(prop));
+            out << ", ";
+            writePropertyTypeJson(out, prop);
             out << ", \"offset\": " << Engine::getPropertyOffset(prop);
             out << ", \"size\": " << Engine::getPropertyElementSize(prop);
             out << ", \"flags\": ";
@@ -645,8 +700,8 @@ static void writeClassJson(std::ostream& out, void* cls, const std::string& clas
                             if (!firstParam) out << ", ";
                             out << "{\"name\": ";
                             writeJsonString(out, fpName);
-                            out << ", \"type\": ";
-                            writeJsonString(out, getPropertyTypeName(fp));
+                            out << ", ";
+                            writePropertyTypeJson(out, fp);
                             out << ", \"flags\": ";
                             writePropertyFlagsJsonArray(out, Engine::getPropertyFlags(fp));
                             out << "}";
@@ -674,7 +729,7 @@ static void writeClassJson(std::ostream& out, void* cls, const std::string& clas
 static void writeStructJson(std::ostream& out, void* ustruct,
                              const std::string& name, const std::string& path) {
     out << "{\n";
-    out << "  \"schemaVersion\": 1,\n";
+    out << "  \"schemaVersion\": 2,\n";
     out << "  \"kind\": \"struct\",\n";
     out << "  \"name\": "; writeJsonString(out, name); out << ",\n";
     out << "  \"path\": "; writeJsonString(out, path); out << ",\n";
@@ -709,7 +764,8 @@ static void writeStructJson(std::ostream& out, void* ustruct,
             if (!first) out << ",";
             out << "\n    {";
             out << "\"name\": "; writeJsonString(out, pName);
-            out << ", \"type\": "; writeJsonString(out, getPropertyTypeName(prop));
+            out << ", ";
+            writePropertyTypeJson(out, prop);
             out << ", \"offset\": " << Engine::getPropertyOffset(prop);
             out << ", \"size\": " << Engine::getPropertyElementSize(prop);
             out << ", \"flags\": ";
@@ -726,6 +782,7 @@ static void writeStructJson(std::ostream& out, void* ustruct,
 // Write a UEnum as JSON. Reads the Names TArray via readEnumNames and
 // emits each (name, value) pair. Schema: {schemaVersion, kind: "enum",
 // name, path, values: [{name, value}]}.
+//
 // Enum entry names come from the FNamePool as fully-qualified
 // "EnumName::EntryName" strings because that's how UE stores them
 // internally. We strip the "EnumName::" prefix so consumers see clean
@@ -860,10 +917,12 @@ static void* findClassMetaclass() {
 
 // trace{target, seconds, output} - log every PE/PI/BP call on the given
 // target UObject for `seconds` seconds to a JSONL file at `output`.
+//
 // target: UObject userdata (from Reflect.findAll / findFirstOf) OR a path
 //         string (e.g. "/Script/Engine.Actor") resolved via findObject.
 // seconds: trace duration in wall-clock seconds (approximately 60 game ticks).
 // output: path to the output JSONL file. Parent directories are created.
+//
 // Returns {ok, expireTick, target} on success or raises a Lua error.
 static int l_trace(lua_State* L) {
     if (!lua_istable(L, 1)) {
@@ -960,7 +1019,7 @@ static int l_dump(lua_State* L) {
         assetsFile.open(outRoot / "_assets.jsonl");
     }
 
-    // -- Single pass over GUObjectArray ---
+    // -- Single pass over GUObjectArray ---------------------------------
     int32_t total = Engine::getObjectCount();
     int rawCount = 0;
     for (int32_t i = 0; i < total; i++) {
@@ -1053,7 +1112,7 @@ static int l_dump(lua_State* L) {
 
     if (assetsFile.is_open()) assetsFile.close();
 
-    // -- Walk class SuperStruct chains ---
+    // -- Walk class SuperStruct chains ----------------------------------
     // Parents of live classes that may not themselves have instances in
     // GUObjectArray. Walking super chains here instead of at insertion
     // time avoids modifying classSet while iterating the array.
@@ -1072,7 +1131,7 @@ static int l_dump(lua_State* L) {
     Hydro::logInfo("[Hydro.Reflect] Dumping %zu validated classes (from %d raw) to '%s' (%s)...",
                    classSet.size(), rawCount, outputDir, asJson ? "JSON" : "text");
 
-    // -- Emit class files ---
+    // -- Emit class files -----------------------------------------------
     int filesWritten = 0;
     for (void* cls : classSet) {
         std::string className;

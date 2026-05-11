@@ -7,11 +7,14 @@
 #include "ModManifest.h"
 #include "LuaRuntime.h"
 #include "api/HydroAssets.h"
+#include "api/HydroPak.h"
 #include "api/HydroWorld.h"
 #include "api/HydroEvents.h"
 #include "api/HydroRegistry.h"
 #include "api/HydroReflect.h"
 #include "api/HydroNet.h"
+#include "api/HydroHUD.h"
+#include "api/HydroUI.h"
 #include "registry/RegistryManager.h"
 #include <filesystem>
 #include <windows.h>
@@ -249,6 +252,9 @@ static void LoadMods() {
                     s_lua.registerModule("Hydro.Registry", Hydro::API::registerRegistryModule);
                     s_lua.registerModule("Hydro.Reflect", Hydro::API::registerReflectModule);
                     s_lua.registerModule("Hydro.Net", Hydro::API::registerNetModule);
+                    s_lua.registerModule("Hydro.HUD", Hydro::API::registerHUDModule);
+                    s_lua.registerModule("Hydro.UI", Hydro::API::registerUIModule);
+                    s_lua.registerModule("Hydro.Pak", Hydro::API::registerPakModule);
                 }
             }
             if (s_lua.isReady()) {
@@ -321,7 +327,7 @@ public:
     HydroCoreMod() : CppUserModBase() {
         ModName = STR("HydroCore");
         ModVersion = STR("0.1.0");
-        ModDescription = STR("Hydro - Core Loader");
+        ModDescription = STR("Hydro Modding Platform - Core Loader");
         ModAuthors = STR("Hydro Team");
 
         Hydro::setLogCallback(ue4ssLogCallback);
@@ -339,9 +345,13 @@ public:
     auto on_unreal_init() -> void override {
         Hydro::logInfo("Unreal Engine ready");
 
-        // Pak mounting
+        // Pak loader discovery (pattern-scan for FPakPlatformFile::Mount).
+        // The actual mount call moved to the engine-tick callback below - on
+        // UE 5.6, mounting from on_unreal_init hits a backend-init timing
+        // window where FFileIoStore::Mount registers an empty PackageStore
+        // entry. Post-engine-init re-mount through the same path forces a
+        // fresh container registration.
         m_core.initPakLoader();
-        m_core.executePakMounts();
 
         // Initialize EngineAPI eagerly - pattern scanning (or cache load)
         if (!s_engineReady) {
@@ -351,11 +361,77 @@ public:
             }
         }
 
+        // Fire the AR-merge bridge eagerly. The first call lazy-resolves the
+        // IAssetRegistry::Serialize vtable slot via anchor-driven discovery -
+        // a few hundred ms of work that we want to land DURING the loading
+        // screen rather than on a visible game frame. If AR singleton isn't
+        // bound yet at this point (Engine::isReady() returns false), the call
+        // no-ops without setting m_pakMountsExecuted, and the per-tick
+        // callback below picks it up on a later tick.
+        if (s_engineReady) {
+            m_core.executePakMounts();
+        }
+
         // Poll each tick - load mods, then service background tasks
         RC::Unreal::Hook::RegisterEngineTickPostCallback([](RC::Unreal::UEngine*, float) {
-                if (!s_modsLoaded) {
+            // Register the mod's shader library with the renderer. UE auto-
+            // mounts our symlinked paks during engine startup but does NOT
+            // automatically open ShaderCodeLibrary chunks - without this
+            // call, content materials fall back to grey defaults. Hard-
+            // coded library name for the dmg-fresh test case (matches the
+            // unique-naming scheme in hydro pack: ShaderArchive-Hydro_<modId>);
+            // multi-mod support needs to walk the manifest's mods.
+            // Shader-library registration intentionally skipped pending a
+            // non-inlined OpenLibrary entry point. In PGO'd shipping builds
+            // (DMG, likely Palworld too), MSVC inlines the body of
+            // FShaderCodeLibrary::OpenLibrary into every caller - most
+            // notably the multi-chunk FEngineLoop::PreInitPostStartupScreen
+            // function at the start of engine boot. The .pdata-anchored
+            // resolver in EngineAPI.cpp::findOpenShaderLibrary correctly
+            // identifies the function containing the literal string ref,
+            // but that function is the merged PGO mega-function - calling
+            // it with FString args crashes hard.
+            //
+            // Real fix candidates (research, then implement):
+            //   - FShaderCodeLibrary::AddKnownChunkIDs - pre-register chunk
+            //     IDs before any pak mount, may not be inlined since rare
+            //   - FShaderCodeLibrary::OpenPluginShaderLibrary - DLC path
+            //   - Direct manipulation of FShaderLibrariesCollection::Impl
+            //     internal state (find Impl, inject our library)
+            //   - Hook the host's existing inlined call site to also
+            //     register our library
+
+            if (!s_modsLoaded) {
                 LoadMods();
             }
+            // UE 5.6 runtime pak re-mount. Engine startup file-mounts our
+            // LogicMods/ paks before FPlatformIoDispatcher is fully bound,
+            // which causes FFileIoStore::Mount to register a PackageStore
+            // entry with no walkable StoreEntries. Re-mounting the same paks
+            // post-engine-init through the FPakPlatformFile::Mount delegate
+            // forces a fresh PackageStore registration with valid entries.
+            // Idempotent - sets m_pakMountsExecuted once successful.
+            s_core->executePakMounts();
+            // UE 5.6 mod-content gather. AR's bSearchAllAssets gate defaults
+            // to false in shipping cooks; without explicitly flipping it, the
+            // OnContentPathMounted gather skips our LogicMods/ paks and
+            // Assets.load returns nil. wireArSearchAllAssets is idempotent -
+            // sets a flag once SearchAllAssets returns OK so subsequent ticks
+            // are no-ops. Tries every tick until AR is ready (~few frames
+            // post-engine-init; AR singleton binds slightly later than ours).
+            s_core->wireArSearchAllAssets();
+            // Drop-folder watcher. Off by default; opted in via env var
+            // HYDRO_PAKS_WATCH=1. When enabled, polls <gameDir>/HydroPaks/
+            // every ~60 ticks and runtime-mounts any new *.pak it finds via
+            // Engine::mountPakAtRuntime. Internal throttle so we don't burn
+            // every-frame syscalls.
+            s_core->pollHydroPaks();
+            // (IoStoreOnDemand singleton scan removed - empirically confirmed
+            // 2026-05-08 that the subsystem isn't instantiated on cooks that
+            // don't ship a CDN-streaming setup. Even though Mount + vtable are
+            // statically linked in DMG@5.6, no singleton ever gets allocated,
+            // so per-tick module-memory scans found 0/19M pointer matches and
+            // burned ~80 ms per scan. See project_iostore_ondemand_pivot memory.)
             // Process reflection dump batches (no-op if no dump active)
             Hydro::API::tickDump();
             // Expire trace listeners (no-op if none active)

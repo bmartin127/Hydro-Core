@@ -18,21 +18,51 @@
 
 #include <Zydis/Zydis.h>
 
-// hydro_raw_funcs.bin: u32 magic, u64 moduleSize, u32 count,
-// then count * [u16 nameLen, char name[nameLen], i64 offset] (-1 = failed).
+/*
+ * RawFunctions implementation.
+ *
+ * Three strategies share three primitives:
+ *   - findWideString: linear scan for a UTF-16 literal in the module
+ *   - findLeaRef:     scan for a LEA instruction whose disp32 lands on `target`
+ *   - walkToFuncStart: walk backward from a code address until CC padding
+ *
+ * These mirror the helpers in EngineAPI.cpp; reimplementing them here keeps
+ * RawFunctions self-contained (no internal-header dependency) and the code
+ * footprint is < 30 lines.
+ *
+ * Cache file format (hydro_raw_funcs.bin):
+ *   header:
+ *     u32 magic (CACHE_MAGIC)
+ *     u64 moduleSize
+ *     u32 entryCount
+ *   entries[entryCount]:
+ *     u16  nameLen
+ *     char name[nameLen]
+ *     i64  offsetFromModuleBase   (-1 sentinel = discovery failed; cached so
+ *                                  we don't re-attempt on every launch)
+ *
+ * Invalidation: header magic + moduleSize mismatch wipes the cache. Manual
+ * invalidate(name) drops the single entry without touching the rest.
+ */
 
 namespace Hydro::Engine::RawFn {
 
 namespace {
 
 constexpr uint32_t CACHE_MAGIC = 0x52415746;  // 'RAWF'
-constexpr ptrdiff_t FAILED_SENTINEL = -1;
 
+// In-memory state
 std::mutex                                       s_mutex;
 std::unordered_map<std::string, Descriptor>      s_descriptors;
 std::unordered_map<std::string, void*>           s_resolved;
-std::unordered_map<std::string, ptrdiff_t>       s_offsetCache;
+std::unordered_map<std::string, ptrdiff_t>       s_offsetCache;  // populated from disk on first use
 bool                                             s_cacheLoaded = false;
+
+// Resolved offsets coming from the on-disk cache use a sentinel so a
+// "we already tried, it failed" outcome isn't re-attempted every launch.
+constexpr ptrdiff_t FAILED_SENTINEL = -1;
+
+// -- Module helpers -------------------------------------------------------
 
 uint8_t* findWideStringIn(uint8_t* base, size_t size, const wchar_t* str) {
     size_t strBytes = wcslen(str) * 2;
@@ -48,8 +78,8 @@ uint8_t* findLeaRefIn(uint8_t* base, size_t size, uint8_t* target) {
     for (size_t i = 0; i + 7 < size; i++) {
         if ((base[i] == 0x48 || base[i] == 0x4C) && base[i + 1] == 0x8D) {
             uint8_t modrm = base[i + 2];
-            // ModR/M with mod=00 rm=101 = rip-relative disp32. Accept all
-            // reg fields (REX.R lifts the high bit for r8..r15).
+            // ModR/M with mod=00 reg=*** rm=101 -> rip-relative disp32.
+            // Accept both lo (rax/rcx/...) and hi (r8..r15 - REX.R bit) regs.
             if ((modrm & 0xC7) != 0x05 && (modrm & 0xC7) != 0x0D &&
                 (modrm & 0xC7) != 0x15 && (modrm & 0xC7) != 0x1D &&
                 (modrm & 0xC7) != 0x25 && (modrm & 0xC7) != 0x2D &&
@@ -70,7 +100,8 @@ uint8_t* walkToFuncStartFrom(uint8_t* addr, int maxBack = 16384) {
     return addr;
 }
 
-// Follow chained jmp trampolines (E9 rel32, FF 25 rip-relative).
+// Follow chained jmp trampolines. Mirrors HydroEvents.cpp::resolveJmpTrampoline
+// - kept private here so RawFunctions doesn't pull in HydroEvents' headers.
 void* resolveTrampoline(void* addr, int depth = 0) {
     if (!addr || depth >= 8) return addr;
     const uint8_t* p = (const uint8_t*)addr;
@@ -88,6 +119,8 @@ void* resolveTrampoline(void* addr, int depth = 0) {
     }
     return addr;
 }
+
+// -- Cache file ----------------------------------------------------------
 
 std::string cachePath() {
     char path[MAX_PATH];
@@ -107,7 +140,7 @@ void loadCache() {
     s_cacheLoaded = true;
 
     size_t modSize = Engine::getGameModuleSize();
-    if (modSize == 0) return;  // engine not up yet
+    if (modSize == 0) return;  // engine not up yet - load deferred to next call
 
     FILE* f = fopen(cachePath().c_str(), "rb");
     if (!f) return;
@@ -126,7 +159,7 @@ void loadCache() {
         return;
     }
     if (fread(&count, 4, 1, f) != 1) { closer(); return; }
-    if (count > 4096) { closer(); return; }  // sanity
+    if (count > 4096) { closer(); return; }  // sanity - we'd never register that many
 
     for (uint32_t i = 0; i < count; i++) {
         uint16_t nameLen = 0;
@@ -162,6 +195,8 @@ void saveCache() {
     fclose(f);
 }
 
+// -- Discovery strategies ------------------------------------------------
+
 void* discoverUFuncImpl(const Descriptor& d) {
     void* ufunc = Engine::findObject(d.anchor.c_str());
     if (!ufunc) return nullptr;
@@ -171,8 +206,10 @@ void* discoverUFuncImpl(const Descriptor& d) {
     return resolveTrampoline(funcPtr);
 }
 
-// Decode forward from body, return the target of the Nth CALL rel32.
-// Stops at first RET or after kWindow bytes. n is 1-based.
+// Bounded Zydis walk: decode instructions starting at `body`, return the
+// address called by the Nth CALL (rel32). Stops at the first RET or after
+// a generous instruction budget - most function bodies that matter for raw
+// discovery are well under that. n is 1-based.
 void* findNthCallIn(void* body, int n) {
     if (!body || n <= 0) return nullptr;
 
@@ -181,7 +218,7 @@ void* findNthCallIn(void* body, int n) {
                                      ZYDIS_STACK_WIDTH_64))) return nullptr;
 
     const uint8_t* p = (const uint8_t*)body;
-    constexpr size_t kWindow = 4096;
+    constexpr size_t kWindow = 4096;  // generous - covers most non-reflected impls
     int callsSeen = 0;
 
     for (size_t i = 0; i < kWindow; ) {
@@ -199,6 +236,8 @@ void* findNthCallIn(void* body, int n) {
                 return resolveTrampoline(target);
             }
         }
+        // RET ends the function; INT3 padding ends a basic-block region but
+        // we keep going since some functions get padded mid-body by /Gy.
         if (inst.mnemonic == ZYDIS_MNEMONIC_RET) break;
         i += inst.length;
     }
@@ -226,11 +265,15 @@ void* discoverStringRefAnchor(const Descriptor& d) {
     uint8_t* leaInstr = findLeaRefIn(base, size, strAddr);
     if (!leaInstr) return nullptr;
 
+    // Walk backward to function start (CC padding). walkToFuncStartFrom is
+    // generous - string refs often sit deep in a function body.
     return walkToFuncStartFrom(leaInstr);
 }
 
-// __try cannot coexist with C++ destructors under MSVC; pointer arg keeps
-// the frame destructor-free.
+// Inner dispatch - must NOT contain any locals with non-trivial destructors
+// (HYDRO_SEH_TRY / __try is incompatible with C++ unwinding under MSVC).
+// All std::wstring usage stays inside the dispatched routines, which return
+// raw pointers; only primitive types cross the SEH boundary here.
 bool dispatchSEH(const Descriptor* d, void** out) {
 #ifdef _WIN32
     __try {
@@ -254,6 +297,10 @@ bool dispatchSEH(const Descriptor* d, void** out) {
 #endif
 }
 
+// Dispatch to the appropriate strategy. Wrapped in SEH so a misbehaving
+// descriptor can't take down the host - discovery returning nullptr is the
+// expected failure path. Caller passes a Descriptor by const-ref; we hand
+// it through a pointer so the SEH-wrapped frame holds no destructors.
 void* dispatch(const Descriptor& d) {
     void* result = nullptr;
     if (!dispatchSEH(&d, &result)) {
@@ -265,14 +312,17 @@ void* dispatch(const Descriptor& d) {
 
 } // anonymous namespace
 
+// -- Public API ---------------------------------------------------------
+
 void registerFn(const std::string& name, const Descriptor& desc) {
     std::lock_guard<std::mutex> lk(s_mutex);
-    s_descriptors.emplace(name, desc);  // first-wins
+    s_descriptors.emplace(name, desc);  // first-wins; idempotent
 }
 
 void* resolve(const std::string& name) {
     std::lock_guard<std::mutex> lk(s_mutex);
 
+    // Fast path: already resolved this launch.
     auto live = s_resolved.find(name);
     if (live != s_resolved.end()) return live->second;
 
@@ -280,14 +330,17 @@ void* resolve(const std::string& name) {
 
     auto descIt = s_descriptors.find(name);
     if (descIt == s_descriptors.end()) {
-        Hydro::logWarn("RawFunctions: resolve(\"%s\") not registered", name.c_str());
+        Hydro::logWarn("RawFunctions: resolve(\"%s\") - not registered", name.c_str());
         return nullptr;
     }
 
+    // Try cache first (already filtered by module size on load).
     uint8_t* base = Engine::getGameModuleBase();
     auto cachedIt = s_offsetCache.find(name);
     if (cachedIt != s_offsetCache.end() && base) {
         if (cachedIt->second == FAILED_SENTINEL) {
+            // We tried and failed last launch under the same module size -
+            // don't burn cycles re-attempting. Game patch will reset this.
             s_resolved[name] = nullptr;
             return nullptr;
         }
@@ -296,6 +349,7 @@ void* resolve(const std::string& name) {
         return addr;
     }
 
+    // Cache miss - actually walk the descriptor.
     void* addr = dispatch(descIt->second);
     s_resolved[name] = addr;
 
@@ -313,14 +367,17 @@ void* resolve(const std::string& name) {
 }
 
 void resolveAllRegistered() {
-    // Snapshot under lock; resolve() takes s_mutex itself.
+    // Snapshot under lock to avoid recursive lock when each resolve() takes
+    // s_mutex itself.
     std::vector<std::string> names;
     {
         std::lock_guard<std::mutex> lk(s_mutex);
         names.reserve(s_descriptors.size());
         for (auto& kv : s_descriptors) names.push_back(kv.first);
     }
-    for (auto& n : names) (void)resolve(n);
+    for (auto& n : names) {
+        (void)resolve(n);
+    }
 }
 
 void invalidate(const std::string& name) {

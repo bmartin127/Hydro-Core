@@ -9,7 +9,7 @@
 ///   - Adding creatures? Use Hydro.SN2.Creatures.register() instead.
 ///   - Adding items? Use Hydro.SN2.Items.register() instead.
 ///   Specific APIs enable conflict detection, multiplayer sync, and
-///   survive game updates.
+///   survive game updates. See CONTRIBUTING_TIER2.md for details.
 ///
 /// @depends EngineAPI (StaticLoadObject, AssetRegistry, ProcessEvent)
 /// @engine_systems AssetRegistry, GameplayStatics, UWorld
@@ -60,6 +60,25 @@ static int l_assets_load(lua_State* L) {
     const char* path = luaL_checkstring(L, 1);
     void* asset = Engine::loadAsset(toWide(path).c_str());
     Lua::pushUObject(L, asset);
+    return 1;
+}
+
+// Assets.directLoad - diagnostic: AR-bypass via StaticLoadObject
+
+/// Force-load a UObject by path via StaticLoadObject, bypassing the
+/// AssetRegistry lookup. Uses the same path `Assets.spawn`'s Tier-3
+/// fallback uses internally. Useful when investigating whether a load
+/// failure is "AR doesn't know about it" (Assets.load returns nil but
+/// directLoad succeeds -> AR is the blocker, FPackageStore has the package)
+/// vs. "FPackageStore doesn't have it" (both return nil -> deeper issue).
+///
+/// Not the recommended user-facing API - `Assets.load` should be used in
+/// shipping mod code. This is for diagnostics during host-bringup.
+static int l_assets_directLoad(lua_State* L) {
+    const char* path = luaL_checkstring(L, 1);
+    void* obj = Engine::loadObject(toWide(path).c_str());
+    Hydro::logInfo("[Hydro.Assets] directLoad('%s') = %p", path, obj);
+    Lua::pushUObject(L, obj);
     return 1;
 }
 
@@ -128,6 +147,7 @@ static int l_assets_spawn(lua_State* L) {
     //      including from runtime-mounted mod paks whose contents were
     //      never in the original game's AssetRegistry. This is the tier
     //      that makes runtime mod content-loading actually work.
+    //
     // Validate each tier: on hosts where the UFunction layout discovery
     // misfires (e.g. Palworld's forked engine), `loadAsset` can return a
     // bogus value (an FName index packed as void*). Real x64 user-mode heap
@@ -203,10 +223,11 @@ static int l_assets_destroy(lua_State* L) {
 // Module registration
 
 static const luaL_Reg assets_functions[] = {
-    {"load",    l_assets_load},
-    {"find",    l_assets_find},
-    {"spawn",   l_assets_spawn},
-    {"destroy", l_assets_destroy},
+    {"load",       l_assets_load},
+    {"directLoad", l_assets_directLoad},
+    {"find",       l_assets_find},
+    {"spawn",      l_assets_spawn},
+    {"destroy",    l_assets_destroy},
     {nullptr,   nullptr}
 };
 

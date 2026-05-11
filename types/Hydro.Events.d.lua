@@ -11,7 +11,7 @@
 ---   timers).
 ---
 ---   NOTE: For game-specific events, prefer dedicated Tier 2 modules
----   when available.
+---   when available. See CONTRIBUTING_TIER2.md.
 --- @depends EngineAPI
 --- @engine_systems UFunction::Func native pointer
 

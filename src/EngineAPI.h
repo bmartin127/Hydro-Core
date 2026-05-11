@@ -36,6 +36,25 @@ bool isReady();
 /// Re-scans GUObjectArray for the current active world.
 bool refreshWorld();
 
+// FString utilities
+
+/// 16-byte FString layout (UE 5.x). Same shape across the IoStore /
+/// AssetRegistry / Kismet ProcessEvent paths - every shipping cook in
+/// the supported engine range uses Data ptr + Num + Max int32 pair. Any
+/// engine-side FString slot can be addressed as one of these.
+struct FStringMinimal {
+    wchar_t* Data;
+    int32_t  ArrayNum;  // chars including the trailing null
+    int32_t  ArrayMax;
+};
+static_assert(sizeof(FStringMinimal) == 16, "FStringMinimal must match UE FString shipping layout");
+
+/// Populate `out` with a GMalloc-allocated copy of `src` so UE's allocator
+/// owns the buffer (passing the FString into engine code that frees the
+/// Data pointer is then safe). Returns false if GMalloc isn't ready or
+/// the underlying allocation failed.
+bool buildFString(FStringMinimal& out, const wchar_t* src);
+
 // Object loading
 
 /// Find an in-memory UObject by path (e.g., "/Script/Engine.Actor").
@@ -65,7 +84,7 @@ void* loadObject(const wchar_t* path);
 /// `libraryName` is the token between `ShaderArchive-` and the first `-`
 /// in the cooked filename (typically the modder's project name).
 /// `mountDir` is the path where the archive lives inside the mount, e.g.
-/// `../../../DummyModdableGame/Content/`.
+/// `../../../<HostProject>/Content/`.
 ///
 /// Returns true on success, false on failure or if discovery hasn't run.
 bool openShaderLibrary(const wchar_t* libraryName, const wchar_t* mountDir);
@@ -75,6 +94,25 @@ bool openShaderLibrary(const wchar_t* libraryName, const wchar_t* mountDir);
 /// (use UE4SS's RC::Unreal::FString for GMalloc-allocated buffers).
 /// Returns nullptr if discovery hasn't run or failed.
 void* getOpenShaderLibraryFn();
+
+/// Get the discovered `UE::IoStore::OnDemand::Mount` function pointer
+/// (UE 5.4+ IoStoreOnDemand module). Returns nullptr if discovery hasn't
+/// run, the host doesn't link `IoStoreOnDemandCore`, or the anchor string
+/// wasn't present in the binary. On legacy non-IoStore hosts this is the
+/// expected outcome - `Core::executePakMounts` falls back to PakLoader.
+///
+/// The actual mount call (`mountIoStoreContainer`) lands in a follow-up
+/// commit once `FOnDemandMountArgs` field offsets are read off the
+/// resolved function's prologue dump (which discovery emits to the log).
+void* getIoStoreOnDemandMountFn();
+
+/// Get the live `IOnDemandIoStore*` singleton instance pointer (the
+/// `this` argument passed to Mount). Re-reads the cached global pointer
+/// each call because the singleton is allocated dynamically - only the
+/// global's static address is cacheable across launches. Returns nullptr
+/// if singleton discovery hasn't run, or if the subsystem hasn't bound
+/// its instance yet (early-init window).
+void* getIoStoreOnDemandSingleton();
 
 /// Trigger an AssetRegistry rescan of a virtual path so newly-mounted paks
 /// become discoverable via GetAsset / GetAssetByObjectPath. Calls the
@@ -89,7 +127,7 @@ bool scanAssetRegistryPaths(const wchar_t* virtualPath, bool forceRescan = false
 /// runtime-mounted pak whose virtual mount point isn't registered with
 /// `FPackageName` becomes discoverable. Calls the reflected UFUNCTION
 /// `IAssetRegistry::ScanFilesSynchronous` - this takes a filesystem path
-/// list rather than a virtual /Game/ path, which on Palworld's UE 5.1 fork
+/// list rather than a virtual /Game/ path, which on some UE 5.1-forked hosts
 /// bypasses the broken `FPackageName::TryConvertLongPackageNameToFilename`
 /// step that drops our /Game/Mods/* paths silently. Use after pak mount when
 /// `scanAssetRegistryPaths` has returned without indexing anything (verified
@@ -105,6 +143,83 @@ bool scanAssetRegistryFiles(const wchar_t* uassetFilename, bool forceRescan = fa
 /// it doesn't burn CPU on the game thread. Safe to call every frame.
 void tryDeferredAssetRegistryDiscovery();
 
+/// Trigger a full AR rescan of every mounted content path via the reflected
+/// UFUNCTION `IAssetRegistry::SearchAllAssets(bool bSynchronousSearch)`.
+///
+/// This is the UE 5.6 escape hatch when the on-mount gather path is gated by
+/// `bSearchAllAssets=false` (default in shipping cooks) - calling this with
+/// `bSynchronousSearch=true` flips the flag AND forces a same-callstack scan
+/// of every mounted .uasset, including ones inside runtime-mounted paks.
+///
+/// Heavier than ScanPathsSynchronous (whole game, not just /Game/Mods), but
+/// the targeted variant doesn't fire on 5.6 shipping; this does. Run once
+/// post-pak-mount, not per loadAsset miss. Logs elapsed milliseconds so the
+/// cost is auditable.
+///
+/// Returns true on successful ProcessEvent dispatch (NOT confirmation that
+/// indexing produced AR entries - caller should re-issue loadAsset to verify).
+bool searchAllAssets(bool bSynchronousSearch);
+
+/// Read an AR.bin sidecar from disk and merge it into the live IAssetRegistry
+/// via `IAssetRegistry::Serialize(FArchive&)` - the standard runtime AR-merge
+/// entry point used by ModSkeleton / mod.io / any in-tree code that adds
+/// asset entries from a file at runtime.
+///
+/// Necessary on UE 5.6 hosts where engine-startup auto-mounted LogicMods/
+/// pakchunk* triples mount the IoStore container but DO NOT auto-merge the
+/// sidecar AssetRegistry.bin into the live AR (worked in 5.5, regressed in 5.6).
+/// Call this once per mod after engine startup (idempotent - if AR already
+/// has the asset entries because of host-side auto-merge, the caller should
+/// skip via a pre-check on a known asset path).
+///
+/// Resilient: the IAssetRegistry::Serialize vtable slot is empirically probed
+/// on first call and cached (in-memory + persisted to ScanCache for warm
+/// starts). No baked offsets, no per-host config.
+///
+/// Returns false if AR isn't discovered yet, the file can't be read, the
+/// vtable slot probe fails, the dispatch SEH-crashes, or the engine's
+/// Serialize sets ArIsError mid-read (e.g. version mismatch). Logs every
+/// outcome.
+bool loadAssetRegistryBin(const wchar_t* arBinPath);
+
+/// Diagnostic: get the discovered UAssetRegistryImpl::Serialize function
+/// pointer, or nullptr if it hasn't been probed yet. Useful for cache
+/// verification and resolver-stability tests across engine versions.
+void* getAssetRegistrySerializeFn();
+
+/// Mount a pak file at runtime (after engine init). Calls
+/// FPakPlatformFile::Mount(pakFilename, order) on the discovered
+/// instance, then merges the optional AssetRegistry.bin sidecar via
+/// IAssetRegistry::AppendState (same path as startup AR.Serialize bridge).
+///
+/// Discovery prerequisites: tryMergeViaAppendState must have run first
+/// - it captures the FFilePackageStoreBackend pointer and reverse-derives
+/// FPakPlatformFile from it. If discovery hasn't completed, this returns
+/// false with a log message.
+///
+/// `pakPath` should be an absolute filesystem path (e.g.
+/// `D:/.../Content/Paks/HotMods/foo.pak`). The .utoc/.ucas siblings must
+/// be at the same path with their respective extensions.
+///
+/// `arBinPath` is optional - pass nullptr to skip the AR merge step.
+///
+/// `priority` - UE pak load order. Higher mounts later (overrides earlier).
+/// Pass something high like 1000 for runtime-mounted mods to win against
+/// engine-startup paks.
+///
+/// Returns true if Mount returned true AND (if arBinPath != nullptr)
+/// AppendState succeeded. Returns false on any failure; logs explain why.
+bool mountPakAtRuntime(const wchar_t* pakPath,
+                       const wchar_t* arBinPath,
+                       uint32_t priority);
+
+/// Diagnostic: returns the reverse-discovered FPakPlatformFile instance
+/// (set by tryMergeViaAppendState). Null until that bridge runs at least
+/// once successfully and the FPackageStore inspection captures the
+/// FFilePackageStoreBackend pointer. Useful for verifying discovery
+/// stability across launches.
+void* getFPakPlatformFile();
+
 // Actor spawning
 
 /// Spawn an actor in the world.
@@ -112,6 +227,44 @@ void tryDeferredAssetRegistryDiscovery();
 /// x, y, z: world coordinates
 /// Returns spawned AActor* or nullptr on failure.
 void* spawnActor(void* actorClass, double x, double y, double z);
+
+/// Construct a UObject of `uclass` via the engine's
+/// `StaticConstructObject_Internal` - UE's NewObject primitive.
+///
+/// `outer` may be null; SCO defaults to GetTransientPackage(). For
+/// gameplay-context objects (UMG widgets etc.) pass a valid Outer that
+/// implements GetWorld() (a UWorld, UGameInstance, or live actor).
+///
+/// Resolution of SCO itself is handled at bootstrap via the string-anchor
+/// + statistical-convergence resolver - this is just the call wrapper.
+/// Returns nullptr if SCO wasn't resolved or the underlying call fails.
+void* staticConstructObject(void* uclass, void* outer);
+
+/// Set the text on a UMG text-bearing widget (UTextBlock, URichTextBlock,
+/// UEditableText, UEditableTextBox, UMultiLineEditableText, etc.) by
+/// going string -> FText -> SetText.
+///
+/// `SetText` UFunctions in UMG take FText, not FString, and FText
+/// construction needs the engine's text infrastructure - there's no
+/// stable C-callable `FText::FromString`. We route through the
+/// `UKismetTextLibrary::Conv_StringToText` UFunction (BlueprintPure,
+/// always reflectable in shipping). Conv_StringToText returns an FText
+/// that we copy directly into the widget's SetText param buffer.
+///
+/// Returns false if the widget isn't text-bearing, the conv function
+/// isn't reachable, or any reflection step fails. The FString backing
+/// buffer is GMalloc-allocated; UE owns it after the call.
+bool setWidgetText(void* widget, const wchar_t* text);
+
+/// Modify a UClass's ClassFlags via direct memory write at the
+/// discovered ClassFlags offset. `setMask` bits are OR'd in,
+/// `clearMask` bits are AND'd out. Use sparingly - most callers should
+/// not be touching engine flags. The one well-defined use case is
+/// clearing CLASS_Abstract on UUserWidget so `UWidgetBlueprintLibrary::Create`
+/// stops rejecting it (raw `staticConstructObject` doesn't need this -
+/// SCO has no Abstract check itself).
+/// Returns the new flag value, or 0 if `cls` is null / discovery failed.
+uint32_t modifyClassFlags(void* cls, uint32_t setMask, uint32_t clearMask);
 
 /// Find the local player's character via UE's own
 /// `UGameplayStatics::GetPlayerCharacter(World, index)`. Uses UE's internal
@@ -202,6 +355,34 @@ void* getChildProperties(void* ustruct);
 /// FProperty::PropertyFlags is a uint64 at offset ~0x38.
 uint64_t getPropertyFlags(void* prop);
 
+/// Get the inner FProperty of an FArrayProperty - describes the element
+/// type (e.g. an Inner of TypeName "NameProperty" means TArray<FName>).
+/// Returns nullptr if the prop isn't an array, or if Stage G discovery
+/// hasn't validated the offset.
+void* getArrayInner(void* arrayProp);
+
+/// Get the UScriptStruct* of an FStructProperty - describes the struct's
+/// shape (its ChildProperties). Returns nullptr if the prop isn't a struct,
+/// or if Stage H discovery hasn't validated the offset.
+void* getStructStruct(void* structProp);
+
+/// Get the UClass* of an FObjectProperty/FClassProperty/FWeakObjectProperty/
+/// FSoftObjectProperty/FSoftClassProperty - the class of the object the
+/// property points to. Returns nullptr if the prop isn't an object reference,
+/// or if the offset hasn't been derived (depends on Stage H having succeeded).
+void* getObjectPropertyClass(void* objectProp);
+
+/// Get the UEnum* of an FEnumProperty - describes the enum's entries.
+/// Returns nullptr if the prop isn't an enum-property, or if the offset
+/// hasn't been derived. Independent from FByteProperty's optional Enum*.
+void* getEnumPropertyEnum(void* enumProp);
+
+/// Get the optional UEnum* of an FByteProperty - set when the byte property
+/// is a TEnumAsByte<...>, null when it's a plain uint8. Returns nullptr if
+/// the prop isn't a byte property, if the offset hasn't been derived, or if
+/// the byte is a plain uint8 (no attached enum).
+void* getBytePropertyEnum(void* byteProp);
+
 // FProperty flag constants
 constexpr uint64_t CPF_Parm       = 0x0000000000000080;
 constexpr uint64_t CPF_OutParm    = 0x0000000000000100;
@@ -237,6 +418,10 @@ std::string getObjectPath(void* obj);
 
 int32_t getObjectCount();
 void* getObjectAt(int32_t index);
+/// Return the FUObjectItem* at the given index (pointer into GUObjectArray's
+/// chunk table). Callers needing GC-aware validity checks read the item's
+/// flags / Object slot rather than re-walking the chunk table.
+void* getObjectItemAt(int32_t index);
 void* getObjClass(void* obj);
 uint32_t getNameIndex(void* obj);
 
@@ -362,6 +547,7 @@ constexpr int FFIELD_NAME           = 0x20;  // FName NamePrivate (fallback only
 // Precedence: discovered > cached > these fallbacks.
 constexpr int FPROP_ELEMENT_SIZE    = 0x34;  // int32 ElementSize    (fallback)
 constexpr int FPROP_OFFSET_INTERNAL = 0x44;  // int32 Offset_Internal (fallback)
+constexpr int FPROP_FLAGS           = 0x38;  // uint64 PropertyFlags (fallback)
 
 // UStruct layout (UE 5.x - bootstrap minimum, kept hardcoded)
 constexpr int USTRUCT_CHILDREN      = 0x48;  // UField* Children (linked list of UFunctions)
@@ -374,11 +560,13 @@ constexpr int UFIELD_NEXT           = 0x28;  // UField* Next
 constexpr int UFUNC_FUNC            = 0xD8;  // FNativeFuncPtr Func
 constexpr int UFUNC_FLAGS           = 0xB0;  // EFunctionFlags
 
-// -- Reflection-driven layout discovery (Layer 2/3/4) ---
+// -- Reflection-driven layout discovery (Layer 2/3/4) ---------------------
+//
 // HydroCore self-adapts to any UE5 host by probing FProperty/UStruct internal
 // offsets at startup against known-good engine objects, then reading every
 // property through the discovered offsets. The hardcoded constants above are
 // fallbacks for stock UE 5.5; real values are picked up from `s_layout`.
+//
 // All getters below transparently use the discovered value if available,
 // falling back to the stock-UE-5.5 constant otherwise. Public signatures
 // (getPropertyOffset, etc.) are unchanged - discovery is internal.
