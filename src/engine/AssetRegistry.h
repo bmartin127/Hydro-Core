@@ -19,7 +19,7 @@ extern void* s_arSerializeFn;
 extern uint16_t s_arSerializeThisOffset;
 
 // FAssetRegistryImpl::Serialize(FArchive&, FEventContext&) - primary path.
-// Located via GUID-literal -> SerializeVersion -> SerializeHeader -> Load walk.
+// Located via GUID-literal → SerializeVersion → SerializeHeader → Load walk.
 extern void* s_arImplSerializeFn;
 extern uint16_t s_arGuardedDataOffset;   // s_assetRegImpl offset to FAssetRegistryImpl GuardedData
 

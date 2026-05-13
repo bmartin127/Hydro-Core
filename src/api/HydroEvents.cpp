@@ -160,7 +160,7 @@ constexpr int FFRAME_NODE_OFFSET = 0x10;
 // from `src` to `dst` one at a time until at least `minBytes` have been
 // consumed, fixing up rip-relative displacements so the copied code runs
 // correctly from its new location. Returns bytes consumed from `src`, or
-// 0 on failure (undecodable, rip-relative beyond +/-2GB, etc.).
+// 0 on failure (undecodable, rip-relative beyond ±2GB, etc.).
 //
 // This replaces the hand-rolled opcode table that only handled ~10 opcodes.
 // Zydis decodes the full x86-64 ISA, so prologues using any valid
@@ -300,7 +300,7 @@ static void* installInlineHookAt(void* target, void* detour, const char* label) 
             // jmp rel32: target = pc + 5 + rel32
             int32_t rel = *(int32_t*)(bytes + 1);
             void* followed = (uint8_t*)target + 5 + rel;
-            logInfo("[Hydro.Events] %s at %p is E9 thunk -> %p", label, target, followed);
+            logInfo("[Hydro.Events] %s at %p is E9 thunk → %p", label, target, followed);
             target = followed;
             bytes = (const uint8_t*)target;
             continue;
@@ -310,7 +310,7 @@ static void* installInlineHookAt(void* target, void* detour, const char* label) 
             int32_t rel = *(int32_t*)(bytes + 2);
             void** slot = (void**)((uint8_t*)target + 6 + rel);
             void* followed = *slot;
-            logInfo("[Hydro.Events] %s at %p is FF 25 thunk -> %p", label, target, followed);
+            logInfo("[Hydro.Events] %s at %p is FF 25 thunk → %p", label, target, followed);
             target = followed;
             bytes = (const uint8_t*)target;
             continue;
@@ -323,7 +323,7 @@ static void* installInlineHookAt(void* target, void* detour, const char* label) 
     // can land directly in the final executable location - this matters
     // because the fixup math uses the trampoline's address as the new PC.
     //
-    // The trampoline MUST land within +/-2GB of `target`: prologue bytes may
+    // The trampoline MUST land within ±2GB of `target`: prologue bytes may
     // contain rip-relative instructions whose disp32/imm32 fields would
     // otherwise overflow when relocated. VirtualAlloc's default placement
     // picks arbitrary high addresses far outside that range.
@@ -332,7 +332,7 @@ static void* installInlineHookAt(void* target, void* detour, const char* label) 
     {
         uintptr_t t = (uintptr_t)target;
         const uintptr_t kGranularity = 0x10000;  // 64KB, Windows alloc granularity
-        const uintptr_t kMaxSearch = (uintptr_t)0x70000000;  // ~1.75GB - safely inside +/-2GB
+        const uintptr_t kMaxSearch = (uintptr_t)0x70000000;  // ~1.75GB - safely inside ±2GB
         // Probe addresses just below `target` first, then just above. Most
         // game modules map in the low half of the 64-bit address space, so
         // searching downward usually hits free regions quickly.
@@ -434,8 +434,8 @@ static void* discoverProcessInternal() {
 // than an inline hook (patching the function's first bytes) because
 // UE4SS may have already inline-hooked BeginPlay. Two inline hooks
 // on the same function don't compose cleanly, but a vtable swap
-// chains through naturally: engine -> our detour -> original vtable
-// entry (possibly UE4SS's detour) -> UE4SS trampoline -> real function.
+// chains through naturally: engine → our detour → original vtable
+// entry (possibly UE4SS's detour) → UE4SS trampoline → real function.
 static void __fastcall hydroBeginPlayDetour(void* actor);
 
 static bool installBeginPlayVtableSwap() {
@@ -448,9 +448,9 @@ static bool installBeginPlayVtableSwap() {
     // Ascended, Satisfactory community tooling all target this exact path.
     //
     // Why it catches BP actors even though AActor::BeginPlay is virtual:
-    //   BP_ThirdPersonCharacter::BeginPlay -> Super -> ACharacter::BeginPlay
-    //   -> Super -> APawn::BeginPlay -> Super -> AActor::BeginPlay (HOOK HERE)
-    //   -> ReceiveBeginPlay -> ProcessEvent -> BP event graph
+    //   BP_ThirdPersonCharacter::BeginPlay → Super → ACharacter::BeginPlay
+    //   → Super → APawn::BeginPlay → Super → AActor::BeginPlay (HOOK HERE)
+    //   → ReceiveBeginPlay → ProcessEvent → BP event graph
     // Only AActor::BeginPlay calls ReceiveBeginPlay, so every well-behaved
     // actor chain reaches our hook. Subclasses that override BeginPlay
     // without calling Super are the one legal-but-rare pattern we miss.

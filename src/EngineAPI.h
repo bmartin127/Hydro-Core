@@ -240,9 +240,54 @@ void* spawnActor(void* actorClass, double x, double y, double z);
 /// Returns nullptr if SCO wasn't resolved or the underlying call fails.
 void* staticConstructObject(void* uclass, void* outer);
 
+/// Extended SCO with a Template parameter. Engine deep-copies properties
+/// from the template into the new object - UE's standard default-
+/// subobject construction primitive. Use to bypass `InitializeWidgetStatic`
+/// for cooked WBPs on UE 5.6 by duplicating class-level archetype widgets
+/// (e.g., CanvasPanel) directly into instance trees.
+void* staticConstructObjectWithTemplate(void* uclass, void* outer, void* tmpl);
+
+/// Deep-copy a UObject + its referenced subobject graph via the engine's
+/// `StaticDuplicateObject` - archive-based duplication (serialize source
+/// to memory archive, deserialize into new object). Unlike the
+/// NewObject-with-template path used internally by
+/// `DuplicateAndInitializeFromWidgetTree`, this copies every UPROPERTY
+/// regardless of `CPF_InstancedReference` / Transient - which is exactly
+/// what UE 5.6 cooked WBP runtime instantiation needs (RootWidget would
+/// otherwise be zeroed by the InstancingGraph filter).
+///
+/// Caller is responsible for assigning the result back into the
+/// containing object's property slot (e.g. `widget->WidgetTree = dup`)
+/// - this wrapper only allocates and copies; it does not wire up the
+/// destination object's references.
+///
+/// Outer must be a valid UObject (cannot be null for non-package
+/// duplicates). Pass the widget instance as the outer when duplicating
+/// a class WidgetTree into a fresh widget.
+///
+/// Returns the duplicated UObject*, or nullptr if SDO wasn't resolved
+/// or the underlying call faulted.
+void* staticDuplicateObject(void* source, void* outer);
+
+/// Invoke `UUserWidget::DuplicateAndInitializeFromWidgetTree(InWidgetTree, {})`
+/// directly on `widget`. UE 5.6's cooked-WBP init path skips this call when
+/// `widget->WidgetTree` is non-null on entry to `InitializeWidgetStatic`
+/// (which it always is in practice for shipping monolithic builds), leaving
+/// the instance tree empty (no RootWidget). Calling D&IFWT directly bypasses
+/// the broken init decision chain - the function deep-copies the class
+/// archetype tree into a fresh `widget->WidgetTree`.
+///
+/// Caller is responsible for nulling `widget->WidgetTree` first (via the Lua
+/// property write) so the function's ensure-equivalent check doesn't get
+/// confused; D&IFWT itself unconditionally builds and assigns a new tree.
+///
+/// Returns true if the underlying call returned normally, false if SDIFWT
+/// wasn't resolved or the call faulted under SEH.
+bool duplicateAndInitializeWidgetTree(void* widget, void* srcWidgetTree);
+
 /// Set the text on a UMG text-bearing widget (UTextBlock, URichTextBlock,
 /// UEditableText, UEditableTextBox, UMultiLineEditableText, etc.) by
-/// going string -> FText -> SetText.
+/// going string → FText → SetText.
 ///
 /// `SetText` UFunctions in UMG take FText, not FString, and FText
 /// construction needs the engine's text infrastructure - there's no

@@ -48,8 +48,8 @@ FArchiveLoader::FArchiveLoader(const uint8_t* bytes, size_t len)
     // checking the cur+N > end test. So `ActiveFPLB` MUST be non-null -
     // standard practice is to point it at the FArchive's own InlineFPLB.
     // With the inline-fpl pointers all null (Start=End=Original=nullptr),
-    // the fast-path check `cur+N > end` evaluates as `N > 0` -> true -> slow
-    // path -> virtual `Ar.Serialize()` -> hits our override.
+    // the fast-path check `cur+N > end` evaluates as `N > 0` → true → slow
+    // path → virtual `Ar.Serialize()` → hits our override.
     //
     // Empirically validated 2026-05-09: with m_ActiveFPLB=nullptr, the
     // inline fast path AV'd at exe+0x12900C9 (`mov rcx, [r8]; lea rax,
@@ -62,7 +62,7 @@ FArchiveLoader::FArchiveLoader(const uint8_t* bytes, size_t len)
     // CustomVersionContainer and iterates its `Versions` TArray. With
     // nullptr the iteration AVs at `mov rax, [rcx]`. Point at our stub
     // (zero-init 64 bytes), which presents an empty TArray header
-    // {Data=null, Num=0, Max=0} -> iteration exits no-op.
+    // {Data=null, Num=0, Max=0} → iteration exits no-op.
     CustomVersionContainer = &m_customVersionsStub[0];
 }
 

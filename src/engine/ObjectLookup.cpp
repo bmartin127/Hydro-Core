@@ -199,9 +199,9 @@ bool findStaticLoadObject() {
 // for early-init lookups (StaticFindObject_InternalNoToStringFromNames).
 //
 // Path syntax: split on '.' and ':' into ordered name parts, e.g.
-//   /Script/Engine.Actor              -> ["/Script/Engine", "Actor"]
-//   /Script/Pkg.Class:Member          -> ["/Script/Pkg", "Class", "Member"]
-//   /Game/Mods/M/Sphere.Sphere_C      -> ["/Game/Mods/M/Sphere", "Sphere_C"]
+//   /Script/Engine.Actor              → ["/Script/Engine", "Actor"]
+//   /Script/Pkg.Class:Member          → ["/Script/Pkg", "Class", "Member"]
+//   /Game/Mods/M/Sphere.Sphere_C      → ["/Game/Mods/M/Sphere", "Sphere_C"]
 //
 // For each candidate whose own FName matches the last part, walk its outer
 // chain comparing each step's FName against the parts in reverse.
@@ -497,12 +497,12 @@ void* findObject(const wchar_t* path) {
 // -- loadAsset -------------------------------------------------------------
 //
 // Two-tier dispatch:
-//   Tier 0 (UE 5.6+ / IoStore): StaticLoadObject -> FPackageStore hash lookup.
+//   Tier 0 (UE 5.6+ / IoStore): StaticLoadObject → FPackageStore hash lookup.
 //     AR is not consulted on this path; pakchunk auto-mount registers our
 //     PackageIds in FPackageStore.MountedContainers directly.
 //   Tier 1 (legacy fallback): AssetRegistry::GetAsset via ProcessEvent.
 //     Same dispatch path BPModLoaderMod uses. Required on older engines where
-//     the pak-mount->AR broadcast wiring is present.
+//     the pak-mount→AR broadcast wiring is present.
 
 // Forward decl - body follows below.
 void* loadObject(const wchar_t* path);
@@ -592,7 +592,7 @@ void* loadAsset(const wchar_t* assetPath) {
     if (pkgNameOffset  < 0) pkgNameOffset  = 0x00;
     if (assetNameOffset < 0) assetNameOffset = 0x10;
 
-    // PackagePath = directory part of PackageName (/Game/Mods/X/Y -> /Game/Mods/X).
+    // PackagePath = directory part of PackageName (/Game/Mods/X/Y → /Game/Mods/X).
     std::wstring pkgPathStr = packageName;
     auto lastSlash = pkgPathStr.find_last_of(L'/');
     if (lastSlash != std::wstring::npos) pkgPathStr = pkgPathStr.substr(0, lastSlash);
@@ -601,9 +601,9 @@ void* loadAsset(const wchar_t* assetPath) {
 
     // FAssetData layout (UE 5.x):
     //   +0x00 FName PackageName
-    //   +0x08 FName PackagePath    <- required by GetAsset's load path
+    //   +0x08 FName PackagePath    ← required by GetAsset's load path
     //   +0x10 FName AssetName
-    //   +0x18 FName AssetClass     <- left zero; optional
+    //   +0x18 FName AssetClass     ← left zero; optional
     uint8_t params[1024] = {};
     memcpy(params + pkgNameOffset,  &pkgFName,     8);
     memcpy(params + 0x08,           &pkgPathFName, 8);
@@ -869,7 +869,7 @@ void seedAndResolveRawFunctions() {
 // Core GUObjectArray scanner for findFirstOf/findAllOf.
 //
 // Performance notes:
-//   Layer 1 - resolve className -> UClass* once, then compare obj->class
+//   Layer 1 - resolve className → UClass* once, then compare obj->class
 //             to that pointer instead of reading each obj->class->name.
 //   Layer 2 - raw reads in the hot loop under one SEH block, not per-read.
 //   Layer 3 - cache last found instance; warm call validates with one read.

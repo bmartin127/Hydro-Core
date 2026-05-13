@@ -58,7 +58,7 @@ uint16_t s_arSerializeThisOffset = 0;     // offset within s_assetRegImpl to pas
 //   if (Ar.IsObjectReferenceCollector()) return;
 //   FEventContext EventContext;       // stack-allocated, zero-init
 //   { FInterfaceWriteScopeLock lock(InterfaceLock);
-//     GuardedData.Serialize(Ar, EventContext); }   // <- THE actual work
+//     GuardedData.Serialize(Ar, EventContext); }   // ← THE actual work
 //   Broadcast(EventContext);
 //
 // We replicate this directly: skip the lock (we're the only thread), skip
@@ -571,12 +571,12 @@ void tryDeferredAssetRegistryDiscovery() {
 //
 // Resolver design - single-anchor + size-heuristic + verify-call:
 //
-//   UAssetRegistryImpl::Serialize           <- what we want (virtual override)
-//     -> FAssetRegistryImpl::Serialize        <- inner non-virtual; on shipping
+//   UAssetRegistryImpl::Serialize           ← what we want (virtual override)
+//     → FAssetRegistryImpl::Serialize        ← inner non-virtual; on shipping
 //                                              cooks this is typically inlined
 //                                              into the outer override
-//          -> if loading: State.Load() + CachePathsFromState() + ...
-//          -> if saving:  State.Save()         <- shipping cooks dead-code
+//          → if loading: State.Load() + CachePathsFromState() + ...
+//          → if saving:  State.Save()         ← shipping cooks dead-code
 //                                              eliminate this entire branch
 //                                              (saving only happens at cook
 //                                              time; Ar.IsSaving() proves
@@ -606,7 +606,7 @@ void tryDeferredAssetRegistryDiscovery() {
 //
 // Algorithm:
 //   1. Single anchor: "FAssetRegistryImpl::CachePathsFromState".
-//      anchor -> LEA xrefs -> funcStartViaPdata -> cache_fn_set.
+//      anchor → LEA xrefs → funcStartViaPdata → cache_fn_set.
 //   2. cache_callers = ⋃ findE8CallersOf(fn) for fn in cache_fn_set.
 //   3. Filter cache_callers: keep entries with .pdata size in (0, 500].
 //      Wrappers are tiny (Serialize was 139 bytes on DMG@5.6); functions
@@ -896,7 +896,7 @@ static bool findArSerializeFnViaVtable() {
                             : score > 0 ? "MATCH"
                             : "MISS";
             Hydro::logInfo("EngineAPI: AR.Serialize vtable[obj+0x%X][%2d] "
-                           "fn=exe+0x%zX (%u ms) ser=%d tot=%d -> %s",
+                           "fn=exe+0x%zX (%u ms) ser=%d tot=%d → %s",
                            cand.off, slot, (size_t)(entry - s_gm.base),
                            callDt, sCalls, tCalls, tag);
 
@@ -1077,6 +1077,44 @@ static bool findArSerializeFnViaStaticAnalysis() {
         return false;
     }
 
+    // MSVC adjustor-thunk detector. Pattern: `48 83 E9 imm8; E9 rel32`
+    // (sub rcx, imm8; jmp body). When the slot points at a thunk, .pdata
+    // has no entry (size==0), and the body lives at `entry + 9 + rel32`.
+    // Follow the jump to the real body, derive the this-adjustment from
+    // the thunk's `sub rcx, imm8` (ground truth), and validate that the
+    // body has its own .pdata entry. If neither, reject - the caller will
+    // surface a discovery miss instead of crashing on a wrongly-shaped call.
+    if (funcSizeViaPdata(entry) == 0 &&
+        entry + 9 <= s_gm.base + s_gm.size &&
+        entry[0] == 0x48 && entry[1] == 0x83 && entry[2] == 0xE9 &&
+        entry[4] == 0xE9) {
+        int8_t thisAdjust = (int8_t)entry[3];
+        int32_t rel = *(int32_t*)(entry + 5);
+        uint8_t* body = entry + 9 + rel;
+        if (body < s_gm.base || body >= s_gm.base + s_gm.size) {
+            Hydro::logWarn("EngineAPI: AR.Serialize static-analysis - slot %d is "
+                           "adjustor thunk but jmp target out of module",
+                           kIAssetRegistrySerializeSlot);
+            return false;
+        }
+        uint8_t* bodyStart = funcStartViaPdata(body);
+        if (!bodyStart) {
+            Hydro::logWarn("EngineAPI: AR.Serialize static-analysis - slot %d is "
+                           "adjustor thunk → exe+0x%zX (no .pdata); rejecting",
+                           kIAssetRegistrySerializeSlot,
+                           (size_t)(body - s_gm.base));
+            return false;
+        }
+        Hydro::logInfo("EngineAPI: AR.Serialize static-analysis - slot %d is "
+                       "adjustor thunk; following to exe+0x%zX (this-adjust=0x%X)",
+                       kIAssetRegistrySerializeSlot,
+                       (size_t)(bodyStart - s_gm.base), (uint8_t)thisAdjust);
+        entry = bodyStart;
+        s_arSerializeFn = entry;
+        s_arSerializeThisOffset = (uint8_t)thisAdjust;
+        return true;
+    }
+
     s_arSerializeFn = entry;
     s_arSerializeThisOffset = arVtable->off;
     Hydro::logInfo("EngineAPI: AR.Serialize resolved at exe+0x%zX (vtable obj+0x%X "
@@ -1219,9 +1257,9 @@ static bool findArSerializeFnViaStaticAnalysis() {
                 }
 
                 // Update register taint:
-                // 1. `mov reg, archiveReg`         -> reg becomes archiveReg
-                // 2. `mov reg, [archiveReg+disp]`  -> reg becomes archiveVtableReg
-                // 3. Any other write to reg        -> clears taint on reg
+                // 1. `mov reg, archiveReg`         → reg becomes archiveReg
+                // 2. `mov reg, [archiveReg+disp]`  → reg becomes archiveVtableReg
+                // 3. Any other write to reg        → clears taint on reg
                 if ((inst.mnemonic == ZYDIS_MNEMONIC_MOV ||
                      inst.mnemonic == ZYDIS_MNEMONIC_LEA) &&
                     inst.operand_count_visible >= 2 &&
@@ -1296,8 +1334,8 @@ static bool findArSerializeFnViaStaticAnalysis() {
         }
     }
 
-    // Threshold: top score must be >= 10 (any real Serialize touches the
-    // archive at least twice) AND must beat runner-up by >= 4 points
+    // Threshold: top score must be ≥ 10 (any real Serialize touches the
+    // archive at least twice) AND must beat runner-up by ≥ 4 points
     // (one extra rdxMem). The original "within 50% = ambiguous" guard
     // was too strict - score=18 vs score=13 is a clear differential
     // when the metric is "discrete count of memory accesses through rdx".
@@ -1377,7 +1415,7 @@ static bool findArSerializeFn() {
 
     DWORD t0 = GetTickCount();
 
-    // -- Step 1: anchor -> cache_fn_set -----------------------------------
+    // -- Step 1: anchor → cache_fn_set -----------------------------------
     auto cacheFns = resolveAnchorFunctions("FAssetRegistryImpl::CachePathsFromState");
     if (cacheFns.empty()) {
         Hydro::logWarn("EngineAPI: AR.Serialize resolver - CachePathsFromState anchor missing; "
@@ -1469,7 +1507,7 @@ static bool findArSerializeFn() {
             }
         }
         Hydro::logInfo("EngineAPI: AR.Serialize 2-hop expansion - "
-                       "%zu hop2 callers -> %zu unique candidates after dedupe",
+                       "%zu hop2 callers → %zu unique candidates after dedupe",
                        hop2Raw.size(), resolvedCallers.size());
         int idx = 0;
         for (uint8_t* e : resolvedCallers) {
@@ -1631,8 +1669,8 @@ static bool findArSerializeFn() {
                         : score > 0 ? "MATCH"
                         : "MISS";
         Hydro::logInfo("EngineAPI: AR.Serialize verify: candidate exe+0x%zX (size=%u) "
-                       "-> ser=%d tot=%d atEnd=%d seek=%d tell=%d stub=%d other=%d "
-                       "score=%d -> %s",
+                       "→ ser=%d tot=%d atEnd=%d seek=%d tell=%d stub=%d other=%d "
+                       "score=%d → %s",
                        (size_t)(cand - s_gm.base), sz,
                        sCalls, tCalls, aCalls, seCalls, tlCalls,
                        stubHits, otherCalls, score, tag);
@@ -1671,11 +1709,11 @@ static bool findArSerializeFn() {
 // FAssetRegistryVersion::GUID literal in .rdata and climbs:
 //
 //   GUID literal (.rdata)
-//     v LEA refs                     (loaded by SerializeVersion's body)
+//     ↓ LEA refs                     (loaded by SerializeVersion's body)
 //   FAssetRegistryVersion::SerializeVersion
-//     v E8 callers                   (typically 1 - SerializeHeader)
+//     ↓ E8 callers                   (typically 1 - SerializeHeader)
 //   FAssetRegistryHeader::SerializeHeader
-//     v E8 callers                   (2: Save, Load - disambiguate by r9 use)
+//     ↓ E8 callers                   (2: Save, Load - disambiguate by r9 use)
 //   FAssetRegistryState::Load
 //
 // Why this works: every step is built on the previous resolver primitives
@@ -1775,7 +1813,7 @@ static bool findArStateLoadFn() {
     Hydro::logInfo("EngineAPI: AR.State.Load - GUID literal at exe+0x%zX",
                    (size_t)(guidLoc - s_gm.base));
 
-    // Step 2: RIP-relative refs -> resolve each to its containing function.
+    // Step 2: RIP-relative refs → resolve each to its containing function.
     // MSVC PGO loads the 16-byte FGuid via SSE (movups/movaps) rather than
     // LEA on UE 5.6 - empirically zero LEA refs but several SSE refs.
     // findAllRipRelativeRefs catches LEA + MOV r64 + SSE-load forms.
@@ -1817,19 +1855,33 @@ static bool findArStateLoadFn() {
                    (size_t)(serializeVersionFn - s_gm.base),
                    bestCount, fnRefCounts.size() - 1);
 
-    // Step 3: E8 callers of SerializeVersion -> SerializeHeader
-    auto serializeHeaderCallers = findE8CallersOf(s_gm.base, s_gm.size, serializeVersionFn);
+    // Step 3: E8 callers of SerializeVersion → SerializeHeader candidates.
+    //
+    // On UE 5.6 PGO/LTO shipping, SerializeVersion is typically inlined into
+    // every caller - so it has 0 E8 callers, even though the GUID-ref scan
+    // resolved it correctly. When that happens, the GUID-ref functions
+    // themselves ARE the SerializeHeader bodies (the GUID-load merged into
+    // them by inlining). Fall through to using every GUID-ref function as
+    // a SerializeHeader candidate so step 4 can still find Save/Load.
+    auto serializeHeaderCallers =
+        findE8CallersOf(s_gm.base, s_gm.size, serializeVersionFn);
     if (serializeHeaderCallers.empty()) {
-        Hydro::logWarn("EngineAPI: AR.State.Load - no E8 callers of SerializeVersion");
-        return false;
+        Hydro::logInfo("EngineAPI: AR.State.Load - no E8 callers of SerializeVersion "
+                       "(likely PGO-inlined); falling through to GUID-ref functions "
+                       "as SerializeHeader candidates");
+        for (auto& kv : fnRefCounts) {
+            serializeHeaderCallers.insert(kv.first);
+        }
+    } else {
+        Hydro::logInfo("EngineAPI: AR.State.Load - %zu callers of SerializeVersion "
+                       "(SerializeHeader candidates)", serializeHeaderCallers.size());
     }
-    Hydro::logInfo("EngineAPI: AR.State.Load - %zu callers of SerializeVersion "
-                   "(SerializeHeader candidates)", serializeHeaderCallers.size());
 
-    // Step 4: E8 callers of SerializeHeader -> {Save, Load}
+    // Step 4: E8 callers of SerializeHeader → {Save, Load}
     auto loadAndSaveCallers = findE8CallersOfAny(serializeHeaderCallers);
     if (loadAndSaveCallers.empty()) {
-        Hydro::logWarn("EngineAPI: AR.State.Load - no E8 callers of SerializeHeader");
+        Hydro::logWarn("EngineAPI: AR.State.Load - no E8 callers of SerializeHeader "
+                       "(tried %zu candidates)", serializeHeaderCallers.size());
         return false;
     }
     Hydro::logInfo("EngineAPI: AR.State.Load - %zu callers of SerializeHeader "
@@ -1838,7 +1890,7 @@ static bool findArStateLoadFn() {
     // Step 5: Disambiguate Load by the SPECIFIC pattern that Load emits and
     // Save doesn't:
     //   if (OutVersion != nullptr) *OutVersion = Header.Version;
-    // -> `test r9, r9; jz X; mov [r9], reg` (or similar). The bare "uses r9"
+    // → `test r9, r9; jz X; mov [r9], reg` (or similar). The bare "uses r9"
     // signal was too noisy on UE 5.6 - 3 of 5 candidates used r9, including
     // chained continuation regions whose r9 use isn't a Load tell.
     //
@@ -1847,7 +1899,7 @@ static bool findArStateLoadFn() {
     //   +5  jz/jnz immediately after a test r9 r9
     //   +3  mov [r9+disp], reg  (writing through r9)
     //   +1  any other r9 use
-    //   -10 fnSize > 1500 bytes (Load is ~50 lines source -> <800 bytes
+    //   -10 fnSize > 1500 bytes (Load is ~50 lines source → <800 bytes
     //                            compiled; Save and outer wrappers are
     //                            larger)
     ZydisDecoder decoder;
@@ -1884,7 +1936,7 @@ static bool findArStateLoadFn() {
     // registers currently hold a value derived from rcx (the `this`
     // pointer) or rdx (the FArchive*). MSVC commonly does
     // `mov r12, rcx` and then writes via `[r12+disp]` - that's still a
-    // write to "this" for our purposes. Same for rdx -> rsi etc.
+    // write to "this" for our purposes. Same for rdx → rsi etc.
     auto regBit = [](ZydisRegister r) -> uint64_t {
         ZydisRegister r64 = ZydisRegisterGetLargestEnclosing(
             ZYDIS_MACHINE_MODE_LONG_64, r);
@@ -1899,7 +1951,10 @@ static bool findArStateLoadFn() {
         ScoredCand sc{entry, fnSize, 0, false, false, false, -1, -1};
         int pos = 0;
         constexpr int kProbeBytes = 200;
-        constexpr int kDiscrimMaxInst = 20;  // discriminator window
+        constexpr int kDiscrimMaxInst = 30;  // discriminator window (UE 5.6 PGO prologues
+                                              // can save 7 callee-saved regs + stack cookie
+                                              // before the first [Ar+disp] read; the old 20
+                                              // missed the rdx-read on the winning candidate.)
         int instIdx = 0;
         // Initial taint: rcx holds `this`, rdx holds Ar.
         uint64_t thisRegs = regBit(ZYDIS_REGISTER_RCX);
@@ -1930,9 +1985,9 @@ static bool findArStateLoadFn() {
                     }
                 }
                 // Update register taint:
-                //   `mov reg, archiveReg`  -> reg becomes archiveReg
-                //   `mov reg, thisReg`     -> reg becomes thisReg
-                //   any other write to reg -> clears taint
+                //   `mov reg, archiveReg`  → reg becomes archiveReg
+                //   `mov reg, thisReg`     → reg becomes thisReg
+                //   any other write to reg → clears taint
                 if ((inst.mnemonic == ZYDIS_MNEMONIC_MOV ||
                      inst.mnemonic == ZYDIS_MNEMONIC_LEA) &&
                     inst.operand_count_visible >= 2 &&
@@ -1987,12 +2042,12 @@ static bool findArStateLoadFn() {
             pos += inst.length;
         }
         // Score:
-        //   - Reads Ar (rdx-derived) early in body  -> Serialize-shaped, +10
-        //   - Writes this (rcx-derived) before any rdx-read -> lazy-init, -20
-        //   - Uses r8 (FEventContext or 3rd arg)    -> +3
-        //   - 3-arg shape AND mid-size              -> consistent with Serialize
-        //   - Has the UAR::Serialize bitfield-test  -> -10 (slot 124 wrapper, NOT inner)
-        //   - Has Save's Header.Version=21 init     -> -10
+        //   - Reads Ar (rdx-derived) early in body  → Serialize-shaped, +10
+        //   - Writes this (rcx-derived) before any rdx-read → lazy-init, -20
+        //   - Uses r8 (FEventContext or 3rd arg)    → +3
+        //   - 3-arg shape AND mid-size              → consistent with Serialize
+        //   - Has the UAR::Serialize bitfield-test  → -10 (slot 124 wrapper, NOT inner)
+        //   - Has Save's Header.Version=21 init     → -10
         sc.score = 0;
         // Lazy-init detector (HIGHEST priority): writes [this+...] BEFORE
         // any [Ar+...] read = NOT Serialize.
@@ -2001,13 +2056,21 @@ static bool findArStateLoadFn() {
              sc.firstRcxLikeWrite < sc.firstRdxLikeRead)) {
             sc.score -= 20;
         }
-        // Serialize signature: reads Ar (rdx-derived) early.
-        if (sc.firstRdxLikeRead >= 0 && sc.firstRdxLikeRead < 10) {
+        // Serialize signature: reads Ar (rdx-derived) early. Window widened
+        // from 10 → 25 because UE 5.6 PGO emits a long prologue (callee-saved
+        // reg spills + stack cookie) before the first [Ar+disp] read on the
+        // winning ~2.5KB candidate.
+        if (sc.firstRdxLikeRead >= 0 && sc.firstRdxLikeRead < 25) {
             sc.score += 10;
         }
         if (sc.usesR8AsPointer)    sc.score += 3;
         if (sc.isUarSerialize)     sc.score -= 10;
         if (sc.isSaveCtor)         sc.score -= 10;
+        // PGO-inlining signal - the real FAssetRegistryImpl::Serialize on
+        // UE 5.6 is ~2.5KB because State.Load + State.Save are both inlined
+        // into it. The thin slot-124 wrapper (UAR::Serialize) and the
+        // continuation chunks are all < 500 bytes.
+        if (sc.size > 1500)        sc.score += 5;
         scored.push_back(sc);
     }
     // Log all candidates with bytes for visual debugging.
@@ -2020,7 +2083,7 @@ static bool findArStateLoadFn() {
     //   0x223C650  size=36     chained continuation
     //   0x227DEB0  size=425    LoadFromDisk (calls IFileManager::Get)
     //   0x22855D0  size=488    Save (initializes Header.Version=21)
-    //   0x396A560  size=2574   FAssetRegistryImpl::Serialize <- we want this
+    //   0x396A560  size=2574   FAssetRegistryImpl::Serialize ← we want this
     //                            (huge because State.Load + State.Save are
     //                            both PGO-inlined into it)
     //
@@ -2118,12 +2181,21 @@ static bool findArStateLoadFn() {
                            (unsigned long long)requestedRva);
         }
     }
-    // Require: positive score, reads rdx early (Serialize-shaped).
-    if (scored.empty() || scored[0].score <= 0 ||
-        scored[0].firstRdxLikeRead < 0 || scored[0].firstRdxLikeRead >= 10) {
-        Hydro::logWarn("EngineAPI: AR.State.Load - no candidate matches "
-                       "FAssetRegistryImpl::Serialize shape (need early rdx-read, "
-                       "no early this-write)");
+    // Require: positive score AND a clear gap over the runner-up. The
+    // firstRdxLikeRead constraint is already in the +10 bonus condition;
+    // double-using it as a hard reject double-penalizes PGO-emit shapes.
+    // Gap-based threshold mirrors the legacy heuristic resolver's pattern.
+    const int kMinScoreGap = 5;
+    if (scored.empty() || scored[0].score <= 0) {
+        Hydro::logWarn("EngineAPI: AR.State.Load - no positive-score candidate "
+                       "matches FAssetRegistryImpl::Serialize shape");
+        return false;
+    }
+    if (scored.size() >= 2 && scored[0].score - scored[1].score < kMinScoreGap) {
+        Hydro::logWarn("EngineAPI: AR.State.Load - top candidate score %d only "
+                       "%d ahead of runner-up (need >= %d); ambiguous, refusing",
+                       scored[0].score,
+                       scored[0].score - scored[1].score, kMinScoreGap);
         return false;
     }
     uint8_t* loadFn = scored[0].entry;
@@ -2266,7 +2338,7 @@ static bool sehCallArImplSerialize(void* this_, void* fn, void* archive,
 // Win64 ABI: rcx=this, rdx=Data, r8=Size, r9b=bFreeOnClose, [rsp+0x20]=bIsPersistent.
 //
 // Discovery: anchor on the literal wide-string "FBufferReader" returned by
-// FBufferReader::GetArchiveName(). LEA-ref -> the GetArchiveName function.
+// FBufferReader::GetArchiveName(). LEA-ref → the GetArchiveName function.
 // Its absolute address appears as a qword in FBufferReader's vtable (slot 3).
 // LEA-refs to the vtable in .text identify the ctor + dtor + (maybe) copy ctor;
 // the ctor uniquely contains `mov [rcx+0xA0], r8` (writes ReaderSize from arg2).
@@ -2368,7 +2440,7 @@ static bool findFBufferReader() {
         if (!gansSlot) continue;
         // GetArchiveName is at FArchive vtable slot 3 (offset 0x18). Walk back.
         uint8_t* vtableBase = gansSlot - 0x18;
-        Hydro::logInfo("EngineAPI: FBufferReader -   trying gan exe+0x%zX -> vtable exe+0x%zX",
+        Hydro::logInfo("EngineAPI: FBufferReader -   trying gan exe+0x%zX → vtable exe+0x%zX",
                        (size_t)(gan - s_gm.base),
                        (size_t)(vtableBase - s_gm.base));
 
@@ -2454,7 +2526,7 @@ static bool sehCallFBRCtor(void* self, void* fn, void* data, int64_t size,
 //
 // LoadFromDisk @ exe+0x227DEB0 (425 bytes, per existing scoring research at
 // EngineAPI.cpp:8720). UAR::AppendState: TBD via offline analysis (string
-// anchor "FAssetRegistryImpl::CachePathsFromState" -> 2-hop E8 climb).
+// anchor "FAssetRegistryImpl::CachePathsFromState" → 2-hop E8 climb).
 //
 // Both RVAs are configurable via env vars to avoid baking into source until
 // we have a robust resolver:
@@ -2483,7 +2555,7 @@ static bool resolveAppendStatePath() {
     resolveEnvRva("HYDRO_AR_APPENDSTATE_RVA",  s_uarAppendStateFn, "UAR::AppendState");
 
     // Re-resolve AppendState via GFP "Mounting" anchor (the canonical
-    // LoadFromDisk -> AppendState pair in Epic's GameFeaturePluginStateMachine).
+    // LoadFromDisk → AppendState pair in Epic's GameFeaturePluginStateMachine).
     // If the env-var-derived AppendState differs from the GFP-derived one, the
     // env-var value was likely a .pdata CHAININFO mid-function miss.
     if (s_loadFromDiskFn) {
@@ -2528,7 +2600,7 @@ static bool resolveAppendStatePath() {
         if (anchorAddrs.empty()) {
             Hydro::logWarn("EngineAPI: GFP-anchor - no anchor strings found in module");
         } else {
-            // Each anchor -> all LEA refs -> containing fns. Dedupe.
+            // Each anchor → all LEA refs → containing fns. Dedupe.
             std::unordered_set<uint8_t*> candidateFns;
             for (uint8_t* sa : anchorAddrs) {
                 auto refs = findAllLeaRefs(s_gm.base, s_gm.size, sa);
@@ -2580,7 +2652,7 @@ static bool resolveAppendStatePath() {
                 Hydro::logInfo("EngineAPI: GFP-anchor -   %zu E8 callees in fn:",
                                sites.size());
                 for (auto& s : sites) {
-                    Hydro::logInfo("EngineAPI: GFP-anchor -     E8 @ +0x%zX -> exe+0x%zX (size=%u)",
+                    Hydro::logInfo("EngineAPI: GFP-anchor -     E8 @ +0x%zX → exe+0x%zX (size=%u)",
                                    s.off, (size_t)(s.tgt - s_gm.base), s.tgtSize);
                 }
                 if (sites.empty()) continue;
@@ -2598,7 +2670,7 @@ static bool resolveAppendStatePath() {
                         best = s;
                     }
                 }
-                Hydro::logInfo("EngineAPI: GFP-anchor -   picked largest E8 @ +0x%zX -> exe+0x%zX (size=%u)",
+                Hydro::logInfo("EngineAPI: GFP-anchor -   picked largest E8 @ +0x%zX → exe+0x%zX (size=%u)",
                                best.off, (size_t)(best.tgt - s_gm.base), best.tgtSize);
                 gfpAppendState = best.tgt;
                 if (gfpAppendState) break;
@@ -2691,8 +2763,8 @@ static bool resolveAppendStatePath() {
     // VTABLE CROSS-CHECK. Read s_assetRegImpl->vtable[N] for N=0..150 and
     // log entries that match s_uarAppendStateFn. The match's slot index is
     // `IAssetRegistry::AppendState`'s vtable position. If exactly one match
-    // -> resolver IS what live AR calls. If 0 matches -> resolver landed on a
-    // function that ISN'T in this AR's vtable -> wrong AR instance OR PGO/LTO
+    // → resolver IS what live AR calls. If 0 matches → resolver landed on a
+    // function that ISN'T in this AR's vtable → wrong AR instance OR PGO/LTO
     // outlined the body and our resolver caught the body, not the slot entry.
     if (s_assetRegImpl && s_uarAppendStateFn) {
         void** vtable = nullptr;
@@ -2875,7 +2947,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
 
     HydroLoadOptions opts;
 
-    Hydro::logInfo("EngineAPI: AppendState path - LoadFromDisk(%ls) -> temp state @ %p",
+    Hydro::logInfo("EngineAPI: AppendState path - LoadFromDisk(%ls) → temp state @ %p",
                    arBinPath, tempState);
     bool loadOk = sehCallLoadFromDisk(s_loadFromDiskFn, arBinPath, &opts,
                                       tempState, nullptr);
@@ -2909,8 +2981,8 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
     // hash table with a local index, it AVs. To test, look up known mod
     // strings in the global pool via FName::Add and scan tempState's first
     // heap allocation for those exact uint32 values. If found at plausible
-    // FAssetData offsets -> indices are global -> divergence is NOT the bug.
-    // If not found -> strong evidence of pool divergence.
+    // FAssetData offsets → indices are global → divergence is NOT the bug.
+    // If not found → strong evidence of pool divergence.
     {
         void* heap = nullptr;
         std::memcpy(&heap, tempState + 0, sizeof(heap));
@@ -2926,15 +2998,15 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
             FName8 fn = {};
             if (safeConstructFName(&fn, probes[i])) {
                 globalIdx[i] = fn.comparisonIndex;
-                Hydro::logInfo("EngineAPI:   FName-probe '%ls' -> global idx=%u",
+                Hydro::logInfo("EngineAPI:   FName-probe '%ls' → global idx=%u",
                                probes[i], globalIdx[i]);
             } else {
-                Hydro::logWarn("EngineAPI:   FName-probe '%ls' -> ctor failed",
+                Hydro::logWarn("EngineAPI:   FName-probe '%ls' → ctor failed",
                                probes[i]);
             }
         }
         // Bound heap read with VirtualQuery so we don't fault scanning past
-        // the allocation. 200 FAssetData entries x ~100 B ~= 20 KB; cap at 64 KB.
+        // the allocation. 200 FAssetData entries × ~100 B ≈ 20 KB; cap at 64 KB.
         size_t scanCap = 64 * 1024;
         MEMORY_BASIC_INFORMATION mbi = {};
         if (heap && VirtualQuery(heap, &mbi, sizeof(mbi)) &&
@@ -2972,7 +3044,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
                         if (hits >= 8) break;
                     }
                 }
-                Hydro::logInfo("EngineAPI:   global idx %u ('%ls') found %dx in heap "
+                Hydro::logInfo("EngineAPI:   global idx %u ('%ls') found %d× in heap "
                                "(first @ +0x%zX)",
                                target, probes[i], hits, firstHit);
             }
@@ -2985,7 +3057,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
     // FName-VIA-TOSTRING diagnostic - definitive divergence test.
     //
     // Per UE 5.6 source review (`AssetRegistryArchive.cpp:307-325`),
-    // FAssetRegistryReader inline-remaps every FName via LoadNameBatch ->
+    // FAssetRegistryReader inline-remaps every FName via LoadNameBatch →
     // ToName(), producing global FNames. The values 58/59/13/etc. seen in
     // the heap dump should be **global FNameEntryId.Value**, not local
     // indices. Test by feeding them through Conv_NameToString (which
@@ -3022,7 +3094,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
                     std::string s2 = getNameString(numberField);
                     Hydro::logInfo("EngineAPI:   tempState heap[%zu]: "
                                    "FName{+8=0x%08X +12=0x%08X} "
-                                   "-> ToString(+12)='%s' / ToString(+8)='%s'",
+                                   "→ ToString(+12)='%s' / ToString(+8)='%s'",
                                    e, numberField, idxField,
                                    s1.empty() ? "(empty)" : s1.c_str(),
                                    s2.empty() ? "(empty)" : s2.c_str());
@@ -3067,8 +3139,8 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
     // CDO-vs-runtime AR check + GUObjectArray walk for live instance.
     // Hypothesis: s_assetRegImpl is the Default__AssetRegistryImpl CDO
     // (placeholder with uninitialized TMaps), not the runtime singleton.
-    // Calling AppendState on a CDO walks empty hash tables -> NumBuckets=0
-    // -> raw hash used as index -> AV at exe+0x221218E with rcx=0x8041440C.
+    // Calling AppendState on a CDO walks empty hash tables → NumBuckets=0
+    // → raw hash used as index → AV at exe+0x221218E with rcx=0x8041440C.
     void* arForCall = s_assetRegImpl;
     {
         uint32_t curFlags = 0;
@@ -3226,7 +3298,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
                                 if (!slot) continue;
                                 if (slot == s_uarAppendStateFn) {
                                     matches++;
-                                    Hydro::logInfo("EngineAPI: SECONDARY vtable[%zu] = exe+0x%zX (== s_uarAppendStateFn) OK",
+                                    Hydro::logInfo("EngineAPI: SECONDARY vtable[%zu] = exe+0x%zX (== s_uarAppendStateFn) ✓",
                                                    s, (size_t)((uint8_t*)slot - s_gm.base));
                                 }
                             }
@@ -3270,14 +3342,14 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
     // `IAssetRegistrySingleton::Singleton` in CoreUObject's .data section.
     // The slot is set ONCE inside `UAssetRegistryImpl::PostInitProperties` (the
     // CDO ctor), to `this` (= the CDO itself). So the CDO IS the live runtime
-    // singleton. Our prior "CDO != runtime" theory was inverted.
+    // singleton. Our prior "CDO ≠ runtime" theory was inverted.
     //
     // Discovery primitive: every caller of IAssetRegistry::Get inlines as
     //   `48 8B 05 disp32        mov rax, [rip+disp32]   ; load Singleton`
     //   `48 85 C0               test rax, rax`
     //   `74 ??` or `0F 84 ...`  je short/near (null check)
     // Scan the binary for this pattern; the disp32 target referenced most often
-    // IS IAssetRegistrySingleton::Singleton. Dereference -> live AR pointer.
+    // IS IAssetRegistrySingleton::Singleton. Dereference → live AR pointer.
     // If it matches s_assetRegImpl, we have ground-truth confirmation that
     // the CDO is correct. (Also: the dereferenced value is what UE itself uses,
     // so passing it as arForCall is the most direct path.)
@@ -3310,7 +3382,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
             safeReadPtr((void*)addr, &val);
             Hydro::logInfo("EngineAPI:   top[%zu] global exe+0x%zX hits=%d *=%p%s",
                            i, (size_t)(addr - (uintptr_t)s_gm.base), sorted[i].second, val,
-                           val == s_assetRegImpl ? " [== s_assetRegImpl OK]" : "");
+                           val == s_assetRegImpl ? " [== s_assetRegImpl ✓]" : "");
         }
 
         // Find the highest-ranked candidate whose dereferenced value matches
@@ -3331,7 +3403,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
             }
         }
         if (singletonAddr) {
-            Hydro::logInfo("EngineAPI: OK IAssetRegistrySingleton::Singleton @ exe+0x%zX "
+            Hydro::logInfo("EngineAPI: ✓ IAssetRegistrySingleton::Singleton @ exe+0x%zX "
                            "hits=%d *=%p (== s_assetRegImpl) - ground truth: CDO IS runtime",
                            (size_t)(singletonAddr - (uintptr_t)s_gm.base),
                            singletonHits, singletonVal);
@@ -3442,7 +3514,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
             if (val >= (void*)s_gm.base &&
                 (uint8_t*)val < s_gm.base + s_gm.size) {
                 discoveredK = off;
-                Hydro::logInfo("EngineAPI: OK K-discovery - IAssetRegistry secondary vtable "
+                Hydro::logInfo("EngineAPI: ✓ K-discovery - IAssetRegistry secondary vtable "
                                "at s_assetRegImpl+0x%zX (vtable=%p, in module range); K=0x%zX",
                                (size_t)off, val, (size_t)off);
                 break;
@@ -3492,7 +3564,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
         }
         bool ok = sehCallAppendState(s_uarAppendStateFn, arForCall_kAdjusted, tempState);
         if (ok) {
-            Hydro::logInfo("EngineAPI: OKOKOK AppendState SUCCEEDED with K-adjusted this - "
+            Hydro::logInfo("EngineAPI: ✓✓✓ AppendState SUCCEEDED with K-adjusted this - "
                            "AR.bin merge call returned");
             // Post-merge probe: count delta tells us if merge actually wrote.
             for (size_t i = 0; i < kNumOffsets; i++) {
@@ -3501,7 +3573,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
                 safeReadInt32((uint8_t*)s_assetRegImpl + mapOffsets[i] + 12, &b);
                 int32_t deltaN = (int32_t)((uint32_t)n - pre[i].numElems);
                 int32_t deltaB = (int32_t)((uint32_t)b - pre[i].numBuckets);
-                Hydro::logInfo("EngineAPI:   TMap[+0x%02zX]: pre {N=%u B=%u} post {N=%u B=%u} deltaN=%+d deltaB=%+d %s",
+                Hydro::logInfo("EngineAPI:   TMap[+0x%02zX]: pre {N=%u B=%u} post {N=%u B=%u} ΔN=%+d ΔB=%+d %s",
                                (size_t)mapOffsets[i],
                                pre[i].numElems, pre[i].numBuckets,
                                (uint32_t)n, (uint32_t)b, deltaN, deltaB,
@@ -3515,7 +3587,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
                 s_lastAppendFaultAddr <  (DWORD64)s_gm.base + s_gm.size) {
                 rva = s_lastAppendFaultAddr - (DWORD64)s_gm.base;
             }
-            Hydro::logWarn("EngineAPI: X AppendState faulted at exe+0x%llX raw=0x%llX "
+            Hydro::logWarn("EngineAPI: ✗ AppendState faulted at exe+0x%llX raw=0x%llX "
                            "code=0x%08X (one-shot - InterfaceLock may now be leaked; "
                            "next AR access could deadlock)",
                            (unsigned long long)rva,
@@ -3579,7 +3651,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
         };
         auto reportFn = [&](uint8_t* strAddr, const char* note, const char* enc) {
             auto refs = findAllLeaRefs(s_gm.base, s_gm.size, strAddr);
-            Hydro::logInfo("EngineAPI:   OK [%s %s] @ exe+0x%zX  (%zu LEA-ref(s))",
+            Hydro::logInfo("EngineAPI:   ✓ [%s %s] @ exe+0x%zX  (%zu LEA-ref(s))",
                            enc, note, (size_t)(strAddr - s_gm.base), refs.size());
             std::unordered_set<uint8_t*> uniqueFns;
             for (auto* r : refs) {
@@ -3875,7 +3947,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
                 for (auto* callee : seenCallees) {
                     uint64_t rva = (uint64_t)(callee - s_gm.base);
                     // PakFile module RVA range on this build; FPakPlatformFile
-                    // sits at 0x23DE630 -> siblings ~0x23B0000-0x2400000.
+                    // sits at 0x23DE630 → siblings ~0x23B0000-0x2400000.
                     if (rva < 0x23A0000 || rva > 0x2410000) continue;
                     uint32_t sz = funcSizeViaPdata(callee);
                     if (sz == 0 || sz > 600) continue;  // tiny thunks + huge fns out
@@ -3972,7 +4044,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
             const char* tag = "";
             if ((q0_heap && q1 < 0x100000000ULL) ||
                 (q2_heap && q3 < 0x100000000ULL))
-                tag = " [LOOKS LIKE POPULATED TMAP OK]";
+                tag = " [LOOKS LIKE POPULATED TMAP ✓]";
             else if (q0 == 0 && q1 == 0 && q2 == 0 && q3 == 0)
                 tag = " [all zeros - empty/uninit]";
             else if (q0_small && q1 == 0 && q2 == 0 && q3 == 0)
@@ -3994,8 +4066,8 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
     // Before any deeper FPackageStore work, verify the bug is actually IN
     // FPackageStore. Find the live singleton, walk its Backends, walk each
     // backend's MountedContainers, and check whether our pak's package(s)
-    // are already registered. If yes -> engine auto-mounted Layer B and
-    // the bug is downstream (StaticLoadObject path). If no -> original
+    // are already registered. If yes → engine auto-mounted Layer B and
+    // the bug is downstream (StaticLoadObject path). If no → original
     // Layer-B-skip theory stands.
     //
     // Discovery: broadened lea-scan. Prior 8-byte Meyers-leaf scan failed
@@ -4011,7 +4083,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
         // Phase A: tally every `lea reg, [rip+disp32]` target. REX.W + 8D + ModRM
         // where ModRM.rm == 5 means RIP-relative. Reg can be RAX/RCX/RDX/RBX
         // (`05/0D/15/1D` for non-extended, `05/0D/15/1D` with REX.R bit 4C
-        // prefix for R8/R9/R10/R11 -> `05/0D/15/1D` with `4C 8D ...`).
+        // prefix for R8/R9/R10/R11 → `05/0D/15/1D` with `4C 8D ...`).
         std::unordered_map<uintptr_t, int> targetTally;
         auto tallyLea = [&](uint8_t* p) {
             int32_t disp = *(int32_t*)(p + 3);
@@ -4022,7 +4094,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
         };
         for (uint8_t* p = s_gm.base; p + 7 < s_gm.base + s_gm.size; p++) {
             // `48 8D` = REX.W lea. ModRM byte at p[2]: top 3 bits = mod=00,
-            // mid 3 bits = reg, low 3 bits = rm=101 (RIP-rel) -> 0x05/0D/15/1D.
+            // mid 3 bits = reg, low 3 bits = rm=101 (RIP-rel) → 0x05/0D/15/1D.
             if ((p[0] == 0x48 || p[0] == 0x4C) && p[1] == 0x8D) {
                 uint8_t modrm = p[2];
                 if ((modrm & 0xC7) == 0x05) {  // mod=00, rm=101
@@ -4083,8 +4155,8 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
         //   [+8..15]  heap ptr   (TSharedRef BackendContext.Controller)
         //   [+16..23] heap ptr or 0 (TArray Backends.Data)
         //   [+24..27] uint32 1..16 (Num)
-        //   [+28..31] uint32 >= Num, <= 32 (Max)
-        // Hits >= 3 (FPackageStore::Get is inlined at multiple sites).
+        //   [+28..31] uint32 ≥ Num, ≤ 32 (Max)
+        // Hits ≥ 3 (FPackageStore::Get is inlined at multiple sites).
         auto isHeapPtr = [](uint64_t v) {
             if ((v >> 48) != 0) return false;
             if (v < 0x0000000100000000ULL) return false;
@@ -4107,11 +4179,11 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
             if (!ok) continue;
             // Tight FPackageStore filter:
             //   +0 BackendContext.Object       - heap ptr, REQUIRED
-            //   +8 BackendContext.RefController - heap ptr, REQUIRED, != +0
+            //   +8 BackendContext.RefController - heap ptr, REQUIRED, ≠ +0
             //  +16 Backends.Data               - heap ptr, REQUIRED non-null
-            //                                    (engine always has >=1 backend)
+            //                                    (engine always has ≥1 backend)
             //  +24 Backends.Num                - uint32 1..16
-            //  +28 Backends.Max                - uint32 >= Num, <= 32
+            //  +28 Backends.Max                - uint32 ≥ Num, ≤ 32
             // "TRUE HEAP" excludes module range AND tiny pointer-encoded
             // ints (the 0x800000000-range "TArray of int ranges" we saw on
             // first run). Real Win64 heap allocations are >= 0x100_0000_0000.
@@ -4132,7 +4204,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
             if (arrMax < arrNum || arrMax > 32) continue;
 
             // FPackageStore-specific shape: BackendContext is a
-            // MakeShared<>'d TSharedRef -> Object and RefController allocated
+            // MakeShared<>'d TSharedRef → Object and RefController allocated
             // in one block, typically 16-48 B apart. Bogus candidates from
             // unrelated tables have Q[0]/Q[1] hundreds of bytes apart.
             uint64_t diff = (q[0] > q[1]) ? (q[0] - q[1]) : (q[1] - q[0]);
@@ -4218,7 +4290,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
                                    vtInModule ? " [in-module]" : " [out]");
                     if (!obj || !vtInModule) continue;
                     // Find MountedContainers. Backend layout: vtable(8) +
-                    // FRWLock(8) + FRWLock(8) + TArray(16) + ... -> +16..+64 sweep.
+                    // FRWLock(8) + FRWLock(8) + TArray(16) + ... → +16..+64 sweep.
                     bool found = false;
                     for (uint32_t off = 16; off <= 64 && !found; off += 8) {
                         int32_t plo=0,phi=0,clo=0,chi=0;
@@ -4401,7 +4473,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
         // separate VirtualAlloc regions. Strategy:
         //   1. Locate the backend's region (cheap VirtualQuery).
         //   2. Scan all writable PRIVATE+COMMIT regions whose base
-        //      addresses sit within +/-1 GB of the backend region.
+        //      addresses sit within ±1 GB of the backend region.
         //      That keeps scan tight (~tens of MB total) and excludes
         //      thread stacks (low addresses, far from heap arenas) and
         //      file mappings (mapped, not private).
@@ -4416,11 +4488,11 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
             return false;
         }
         uintptr_t backendRegion = (uintptr_t)backendMbi.BaseAddress;
-        constexpr uintptr_t kNeighborhood = 0x40000000ull; // +/-1 GB
+        constexpr uintptr_t kNeighborhood = 0x40000000ull; // ±1 GB
         constexpr size_t kMaxRegionBytes = 0x10000000ull;  // 256 MB cap per region
         uintptr_t scanLo = (backendRegion > kNeighborhood) ? (backendRegion - kNeighborhood) : 0;
         uintptr_t scanHi = backendRegion + kNeighborhood;
-        Hydro::logInfo("EngineAPI:   scoped scan in [%p..%p] (+/-1 GB around backend region %p)",
+        Hydro::logInfo("EngineAPI:   scoped scan in [%p..%p] (±1 GB around backend region %p)",
                        (void*)scanLo, (void*)scanHi, (void*)backendRegion);
         uint64_t startTick = GetTickCount64();
         struct Hit { uintptr_t addr; uintptr_t regionBase; size_t regionSize; };
@@ -4521,7 +4593,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
                 if (!s_fpakPlatformFile) {
                     s_fpakPlatformFile = (void*)candStart;
                     s_fpakPlatformFileVtable = (void*)(uintptr_t)maybeVt;
-                    Hydro::logInfo("EngineAPI:   OK adopted FPakPlatformFile=%p vtable=%p (backend field offset 0x%zX)",
+                    Hydro::logInfo("EngineAPI:   ✓ adopted FPakPlatformFile=%p vtable=%p (backend field offset 0x%zX)",
                                    s_fpakPlatformFile, s_fpakPlatformFileVtable, (size_t)back);
                 }
             }
@@ -4544,9 +4616,9 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
     //   1. Empty Content/Paks/<sub>/ of mod paks at game launch.
     //   2. Set HYDRO_RUNTIME_MOUNT_TEST=<pak path> in launch.bat.
     //   3. Game starts WITHOUT mod content registered.
-    //   4. AppendState bridge fires at tick 120 -> reverse-discovery runs
-    //      -> this block calls mountPakAtRuntime once -> pak goes into
-    //      FPackageStore.MountedContainers post-mount -> Assets.load works.
+    //   4. AppendState bridge fires at tick 120 → reverse-discovery runs
+    //      → this block calls mountPakAtRuntime once → pak goes into
+    //      FPackageStore.MountedContainers post-mount → Assets.load works.
     static bool s_runtimeMountTestDone = false;
     if (!s_runtimeMountTestDone && s_fpakPlatformFile) {
         s_runtimeMountTestDone = true;
@@ -4676,11 +4748,11 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
         for (size_t i = 0; i < kPats; i++) {
             const auto& hits = hitsByPat[i];
             if (hits.empty()) {
-                Hydro::logInfo("EngineAPI:   X '%s': NOT FOUND",
+                Hydro::logInfo("EngineAPI:   ✗ '%s': NOT FOUND",
                                pats[i].name);
                 continue;
             }
-            Hydro::logInfo("EngineAPI:   OK '%s': %zu hit(s):",
+            Hydro::logInfo("EngineAPI:   ✓ '%s': %zu hit(s):",
                            pats[i].name, hits.size());
             for (size_t h = 0; h < hits.size() && h < 8; h++) {
                 const auto& hit = hits[h];
@@ -4749,7 +4821,7 @@ static bool tryMergeViaAppendState(const wchar_t* arBinPath) {
         if (s_assetRegImpl &&
             faultAddr >= (DWORD64)s_assetRegImpl &&
             faultAddr <  (DWORD64)s_assetRegImpl + 0x10000) {
-            classify = "INSIDE live AR (s_assetRegImpl +/- 64 KB)";
+            classify = "INSIDE live AR (s_assetRegImpl ± 64 KB)";
         } else if (faultAddr >= (DWORD64)tempState &&
                    faultAddr <  (DWORD64)tempState + sizeof(tempState)) {
             classify = "INSIDE tempState buffer";
@@ -4870,7 +4942,7 @@ bool loadAssetRegistryBin(const wchar_t* arBinPath) {
     // interface-lock or broadcast machinery. UAR::Serialize source:
     //   if (Ar.IsObjectReferenceCollector()) return;
     //   FEventContext EventContext;       // stack zero-init
-    //   { lock; GuardedData.Serialize(Ar, EventContext); }   // <- THE work
+    //   { lock; GuardedData.Serialize(Ar, EventContext); }   // ← THE work
     //   Broadcast(EventContext);
     //
     // We skip the lock (single-threaded call from our bridge) and the
@@ -4880,7 +4952,7 @@ bool loadAssetRegistryBin(const wchar_t* arBinPath) {
     // FEventContext is ~112 bytes (5 TArrays + TOptional<...> + 4 bools).
     // We allocate 256 bytes zero-init for forward-compat. With all zeros,
     // the early buffer-cursor check (`mov rcx, [r8]; cmp rax, [r8+8]`)
-    // sees cur=0, end=0 -> cmp 4, 0 -> ja -> skips the bad-pointer deref
+    // sees cur=0, end=0 → cmp 4, 0 → ja → skips the bad-pointer deref
     // that crashed our prior slot-124 calls.
     if (!s_arImplSerializeFn) {
         findArStateLoadFn();   // soft-fail: leaves ptr null on resolver miss
@@ -5027,7 +5099,7 @@ bool loadAssetRegistryBin(const wchar_t* arBinPath) {
                       (consumedBytes && readerPosAfter * 10 >= (int64_t)bytes.size() * 9);
         if (merged) {
             Hydro::logInfo("EngineAPI: loadAssetRegistryBin: merged %zu bytes from "
-                           "%ls via ImplSerialize (this=%p, ReaderPos %lld -> %lld, "
+                           "%ls via ImplSerialize (this=%p, ReaderPos %lld → %lld, "
                            "callOk=%d)",
                            bytes.size(), arBinPath, guardedDataPtr,
                            (long long)readerPosBefore, (long long)readerPosAfter,
@@ -5060,7 +5132,7 @@ bool loadAssetRegistryBin(const wchar_t* arBinPath) {
             faultRva = (size_t)(s_lastArSerializeFaultAddr - (DWORD64)s_gm.base);
         }
         Hydro::logWarn("EngineAPI: loadAssetRegistryBin: ImplSerialize result "
-                       "(callOk=%d consumedBytes=%d ReaderPos %lld->%lld "
+                       "(callOk=%d consumedBytes=%d ReaderPos %lld→%lld "
                        "this=%p gdOff=0x%X) fault@exe+0x%zX code=0x%08X "
                        "raw=0x%llX",
                        callOk ? 1 : 0, consumedBytes ? 1 : 0,
@@ -5158,7 +5230,7 @@ bool loadAssetRegistryBin(const wchar_t* arBinPath) {
             }
         }
         // Skip the legacy slot-124 fallback - it's known to freeze the game
-        // (slot-124 thunk -> FStructuredArchive adapter ctor that never
+        // (slot-124 thunk → FStructuredArchive adapter ctor that never
         // returns). The override path's diagnostic is the only useful
         // signal we get when ImplSerialize fails. Set HYDRO_AR_SLOT124_FALLBACK=1
         // to re-enable for direct comparison.
@@ -5185,7 +5257,7 @@ bool loadAssetRegistryBin(const wchar_t* arBinPath) {
     }
 
     // Real call with the AR.bin bytes. Engine reads via our `Serialize`
-    // override -> memcpy from `bytes` into engine state.
+    // override → memcpy from `bytes` into engine state.
     //
     // For UE 5.6 the resolved fn entry points at the MSVC adjustor thunk
     // (`sub rcx, 0x28; jmp impl`). We must call with `this` =
@@ -5265,7 +5337,7 @@ bool mountPakAtRuntime(const wchar_t* pakPath,
     if (!s_fpakPlatformFile) {
         Hydro::logError("EngineAPI: mountPakAtRuntime - FPakPlatformFile instance "
                         "not yet discovered. Run AppendState bridge once first "
-                        "(it captures FFilePackageStoreBackend -> FPakPlatformFile).");
+                        "(it captures FFilePackageStoreBackend → FPakPlatformFile).");
         return false;
     }
 
@@ -5293,7 +5365,7 @@ bool mountPakAtRuntime(const wchar_t* pakPath,
 
     // Snapshot FPackageStore.MountedContainers count before mount.
     // After Mount returns true, walk Backends[0].MountedContainers again
-    // to verify our ContainerId showed up (proves Layer A->B fired).
+    // to verify our ContainerId showed up (proves Layer A→B fired).
     auto readBackendMcCount = [&]() -> int32_t {
         if (!s_filePackageStoreBackend) return -1;
         int32_t lo = 0, hi = 0;
@@ -5332,7 +5404,7 @@ bool mountPakAtRuntime(const wchar_t* pakPath,
                    mcNumAfter,
                    (mcNumAfter >= 0 && mcNumBefore >= 0) ? (mcNumAfter - mcNumBefore) : 0);
     if (mcNumAfter > mcNumBefore && mcNumBefore >= 0) {
-        Hydro::logInfo("EngineAPI: mountPakAtRuntime - OK FPackageStore.MountedContainers grew, "
+        Hydro::logInfo("EngineAPI: mountPakAtRuntime - ✓ FPackageStore.MountedContainers grew, "
                        "our pak's container is registered");
     } else {
         Hydro::logWarn("EngineAPI: mountPakAtRuntime - Num didn't grow; Mount returned true "

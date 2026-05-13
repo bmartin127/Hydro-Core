@@ -159,6 +159,63 @@ static int uobject_getclass(lua_State* L) {
     return 1;
 }
 
+static int uobject_getouter(lua_State* L) {
+    UObjectUD* ud = (UObjectUD*)luaL_checkudata(L, 1, UOBJECT_MT);
+    if (!ud->ptr) { lua_pushnil(L); return 1; }
+    pushUObject(L, Engine::getOuter(ud->ptr));
+    return 1;
+}
+
+static int uobject_getname(lua_State* L) {
+    UObjectUD* ud = (UObjectUD*)luaL_checkudata(L, 1, UOBJECT_MT);
+    if (!ud->ptr) { lua_pushnil(L); return 1; }
+    std::string n = Engine::getObjectName(ud->ptr);
+    lua_pushlstring(L, n.data(), n.size());
+    return 1;
+}
+
+static int uobject_getpath(lua_State* L) {
+    UObjectUD* ud = (UObjectUD*)luaL_checkudata(L, 1, UOBJECT_MT);
+    if (!ud->ptr) { lua_pushnil(L); return 1; }
+    std::string p = Engine::getObjectPath(ud->ptr);
+    lua_pushlstring(L, p.data(), p.size());
+    return 1;
+}
+
+static int uobject_getflags(lua_State* L) {
+    UObjectUD* ud = (UObjectUD*)luaL_checkudata(L, 1, UOBJECT_MT);
+    if (!ud->ptr) { lua_pushnil(L); return 1; }
+    int32_t flags = 0;
+    if (!Engine::readInt32((uint8_t*)ud->ptr + Engine::UOBJ_FLAGS, &flags)) {
+        lua_pushnil(L); return 1;
+    }
+    lua_pushnumber(L, (double)(uint32_t)flags);
+    return 1;
+}
+
+// obj:SetFlags(setMask, clearMask) - OR in setMask, AND-NOT clearMask.
+// Returns the new flag value, or nil if read/write failed.
+static int uobject_setflags(lua_State* L) {
+    UObjectUD* ud = (UObjectUD*)luaL_checkudata(L, 1, UOBJECT_MT);
+    uint32_t setMask   = (uint32_t)luaL_checknumber(L, 2);
+    uint32_t clearMask = lua_gettop(L) >= 3 ? (uint32_t)luaL_checknumber(L, 3) : 0;
+    if (!ud->ptr) { lua_pushnil(L); return 1; }
+
+    int32_t cur = 0;
+    if (!Engine::readInt32((uint8_t*)ud->ptr + Engine::UOBJ_FLAGS, &cur)) {
+        lua_pushnil(L); return 1;
+    }
+    uint32_t next = ((uint32_t)cur | setMask) & ~clearMask;
+    volatile uint32_t* slot = (volatile uint32_t*)((uint8_t*)ud->ptr + Engine::UOBJ_FLAGS);
+    __try {
+        *slot = next;
+    } __except(1) {
+        lua_pushnil(L); return 1;
+    }
+    lua_pushnumber(L, (double)next);
+    return 1;
+}
+
 // __index: check builtins -> property -> function
 
 static int uobject_index(lua_State* L) {
@@ -285,6 +342,21 @@ void initUObjectMetatable(lua_State* L) {
 
     lua_pushcfunction(L, uobject_getaddress);
     lua_setfield(L, -2, "GetAddress");
+
+    lua_pushcfunction(L, uobject_getouter);
+    lua_setfield(L, -2, "GetOuter");
+
+    lua_pushcfunction(L, uobject_getname);
+    lua_setfield(L, -2, "GetName");
+
+    lua_pushcfunction(L, uobject_getpath);
+    lua_setfield(L, -2, "GetPath");
+
+    lua_pushcfunction(L, uobject_getflags);
+    lua_setfield(L, -2, "GetFlags");
+
+    lua_pushcfunction(L, uobject_setflags);
+    lua_setfield(L, -2, "SetFlags");
 
     lua_pop(L, 1);
 }

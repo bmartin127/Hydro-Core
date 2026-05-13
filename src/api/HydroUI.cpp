@@ -24,6 +24,8 @@
 #include "../HydroCore.h"
 #include "../EngineAPI.h"
 #include "../LuaUObject.h"
+#include "../engine/Layout.h"
+#include "../engine/Internal.h"
 
 extern "C" {
 #include <lua.h>
@@ -32,6 +34,7 @@ extern "C" {
 }
 
 #include <string>
+#include <cstdio>
 
 namespace Hydro::API {
 
@@ -70,7 +73,14 @@ static int l_ui_newObject(lua_State* L) {
         outer = Lua::checkUObject(L, 2);
     }
 
-    void* result = Engine::staticConstructObject(uclass, outer);
+    void* tmpl = nullptr;
+    if (lua_gettop(L) >= 3 && !lua_isnil(L, 3)) {
+        tmpl = Lua::checkUObject(L, 3);
+    }
+
+    void* result = tmpl
+        ? Engine::staticConstructObjectWithTemplate(uclass, outer, tmpl)
+        : Engine::staticConstructObject(uclass, outer);
     Lua::pushUObject(L, result);
     return 1;
 }
@@ -111,6 +121,231 @@ static int l_ui_findObject(lua_State* L) {
     return 1;
 }
 
+// -- Hydro.UI.duplicateObject -----------------------------------------
+
+/// Deep-copy a UObject (and the subobject graph it owns) via the
+/// engine's `StaticDuplicateObject` - archive-based duplication.
+///
+/// Use case: cooked UE 5.6 WBPs whose `widget.WidgetTree.RootWidget`
+/// comes out nil after `Create()` because the standard UMG init path
+/// uses NewObject-with-template + an InstancingGraph filter that skips
+/// `UWidgetTree::RootWidget` (no `CPF_InstancedReference`).
+/// `StaticDuplicateObject` copies properties via memory-archive
+/// serialization, which writes every UPROPERTY regardless of flags -
+/// recovering the full tree.
+///
+/// Typical usage in Lua:
+///   local widget = libCDO:Create(world, cls, nil)
+///   widget.WidgetTree = UI.duplicateObject(cls.WidgetTree, widget)
+///   widget:AddToViewport(0)
+///
+/// @param source UObject - The object to duplicate (e.g. the class's
+///   WidgetTree)
+/// @param outer UObject - The duplicate's Outer (e.g. the widget
+///   instance receiving the new tree)
+/// @returns UObject - The duplicated object, or nil on failure
+static int l_ui_duplicateObject(lua_State* L) {
+    void* source = Lua::checkUObject(L, 1);
+    void* outer  = Lua::checkUObject(L, 2);
+    void* dup    = Engine::staticDuplicateObject(source, outer);
+    Lua::pushUObject(L, dup);
+    return 1;
+}
+
+// -- Hydro.UI.duplicateAndInitializeWidgetTree ------------------------
+
+/// Invoke UUserWidget::DuplicateAndInitializeFromWidgetTree directly to
+/// bypass UE 5.6's broken cooked-WBP init path. UE 5.6's
+/// `InitializeWidgetStatic` skips its D&IFWT call when `widget.WidgetTree`
+/// is non-null on entry - which it always is in shipping monolithic
+/// builds, leaving the instance tree empty.
+///
+/// Typical usage:
+///   local widget = libCDO:Create(world, cls, nil)
+///   widget.WidgetTree = nil  -- null the broken/stub tree
+///   UI.duplicateAndInitializeWidgetTree(widget, cls.WidgetTree)
+///   widget:AddToViewport(0)
+///
+/// @param widget UObject - The UUserWidget instance to fix.
+/// @param srcWidgetTree UObject - The class archetype WidgetTree
+///   (typically `cls.WidgetTree` where `cls` is the WBP generated class).
+/// @returns boolean - true if the call returned normally.
+static int l_ui_duplicateAndInitializeWidgetTree(lua_State* L) {
+    void* widget = Lua::checkUObject(L, 1);
+    void* src    = Lua::checkUObject(L, 2);
+    bool ok = Engine::duplicateAndInitializeWidgetTree(widget, src);
+    lua_pushboolean(L, ok ? 1 : 0);
+    return 1;
+}
+
+// -- Hydro.UI.dumpProperties ------------------------------------------
+
+/// Walk the class chain (object → its UClass → SuperClass → ...) and dump
+/// every FProperty's name + flag bits + offset + size. Used as a runtime
+/// ground-truth probe: source-code citations claim `UWidgetTree::RootWidget`
+/// has `CPF_InstancedReference` (0x80000) set, but we've never verified
+/// that on the actual binary. This dump tells us.
+///
+/// Output format (Lua-side):
+///   {
+///     class_name = "WidgetTree",
+///     properties = {
+///       { name = "RootWidget", flags = "0x...", offset = N, size = N },
+///       ...
+///     }
+///   }
+///
+/// @param obj UObject - The object whose class chain to walk
+/// @returns table with class hierarchy + property tables, or nil on failure
+static int l_ui_dumpProperties(lua_State* L) {
+    void* obj = Lua::checkUObject(L, 1);
+    if (!obj) { lua_pushnil(L); return 1; }
+
+    auto& layout = Engine::s_layout;
+    if (!layout.succeeded) {
+        Hydro::logWarn("Hydro.UI.dumpProperties: property layout not discovered");
+        lua_pushnil(L);
+        return 1;
+    }
+
+    // Read object's class (UObject::ClassPrivate at +0x10 on all UE 5.x).
+    void* cls = nullptr;
+    if (!Engine::safeReadPtr((uint8_t*)obj + 0x10, &cls) || !cls) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    // Build a Lua array - one entry per class in the chain, each with
+    // its properties.
+    lua_newtable(L);
+    int classIdx = 1;
+
+    while (cls) {
+        // ChildProperties at +childPropsOffset
+        void* fprop = nullptr;
+        if (!Engine::safeReadPtr((uint8_t*)cls + layout.childPropsOffset, &fprop)) break;
+
+        lua_newtable(L);
+        std::string clsName = Engine::getObjectName(cls);
+        lua_pushstring(L, "class");
+        lua_pushstring(L, clsName.c_str());
+        lua_settable(L, -3);
+
+        lua_pushstring(L, "properties");
+        lua_newtable(L);
+        int propIdx = 1;
+
+        while (fprop) {
+            // Property name (FName at +fieldNameOffset, FName.ComparisonIndex is uint32)
+            uint32_t nameIdx = 0;
+            if (!Engine::safeReadInt32((uint8_t*)fprop + layout.fieldNameOffset, (int32_t*)&nameIdx)) break;
+            std::string propName = Engine::getNameString(nameIdx);
+
+            // PropertyFlags (uint64 at +flags)
+            uint64_t propFlags = 0;
+            Engine::safeReadU64((uint8_t*)fprop + layout.flags, &propFlags);
+
+            // Offset_Internal (int32 at +offsetInternal)
+            int32_t propOffset = 0;
+            Engine::safeReadInt32((uint8_t*)fprop + layout.offsetInternal, &propOffset);
+
+            // ElementSize (int32 at +elementSize)
+            int32_t propSize = 0;
+            Engine::safeReadInt32((uint8_t*)fprop + layout.elementSize, &propSize);
+
+            // Build the per-property table
+            lua_newtable(L);
+            lua_pushstring(L, "name");
+            lua_pushstring(L, propName.c_str());
+            lua_settable(L, -3);
+
+            // flags as hex string (Lua numbers can't hold full uint64)
+            char flagsStr[32];
+            std::snprintf(flagsStr, sizeof(flagsStr), "0x%016llX",
+                (unsigned long long)propFlags);
+            lua_pushstring(L, "flags");
+            lua_pushstring(L, flagsStr);
+            lua_settable(L, -3);
+
+            lua_pushstring(L, "offset");
+            lua_pushnumber(L, (double)propOffset);
+            lua_settable(L, -3);
+
+            lua_pushstring(L, "size");
+            lua_pushnumber(L, (double)propSize);
+            lua_settable(L, -3);
+
+            lua_rawseti(L, -2, propIdx++);
+
+            // Next FProperty in chain
+            void* nextProp = nullptr;
+            if (!Engine::safeReadPtr((uint8_t*)fprop + layout.fieldNextOffset, &nextProp)) break;
+            fprop = nextProp;
+        }
+        lua_settable(L, -3);  // properties
+
+        lua_rawseti(L, -2, classIdx++);
+
+        // Walk to SuperStruct (next class in chain)
+        cls = Engine::getSuper(cls);
+    }
+
+    return 1;
+}
+
+// -- Hydro.UI.readPointer ---------------------------------------------
+
+/// Read 8 raw bytes at `obj + offset` as a UObject pointer. Used to
+/// disambiguate "Lua reflection reads the right field offset" vs "C++
+/// direct member access reads from a different baked offset."
+static int l_ui_readPointer(lua_State* L) {
+    void* obj = Lua::checkUObject(L, 1);
+    int offset = (int)luaL_checkinteger(L, 2);
+    if (!obj) { lua_pushnil(L); return 1; }
+    void* val = nullptr;
+    Engine::safeReadPtr((uint8_t*)obj + offset, &val);
+    Lua::pushUObject(L, val);
+    return 1;
+}
+
+// -- Hydro.UI.getSuperClass -------------------------------------------
+
+/// Walk one step up a UClass's super chain via the runtime SuperStruct
+/// offset. Returns nil if the class is at the root (UObject) or super
+/// offset wasn't discovered.
+static int l_ui_getSuperClass(lua_State* L) {
+    void* cls = Lua::checkUObject(L, 1);
+    if (!cls) { lua_pushnil(L); return 1; }
+    void* super = Engine::getSuper(cls);
+    Lua::pushUObject(L, super);
+    return 1;
+}
+
+// -- Hydro.UI.getClassFlags -------------------------------------------
+
+/// Read EClassFlags (CLASS_*) on a UClass. Returns the raw uint32.
+static int l_ui_getClassFlags(lua_State* L) {
+    void* cls = Lua::checkUObject(L, 1);
+    if (!cls) { lua_pushnil(L); return 1; }
+    uint32_t flags = Engine::getClassFlags(cls);
+    char buf[20]; std::snprintf(buf, sizeof(buf), "0x%08X", flags);
+    lua_pushstring(L, buf);
+    return 1;
+}
+
+// -- Hydro.UI.getObjectFlags ------------------------------------------
+
+/// Read EObjectFlags (RF_*) on a UObject. Returns the raw uint32.
+static int l_ui_getObjectFlags(lua_State* L) {
+    void* obj = Lua::checkUObject(L, 1);
+    if (!obj) { lua_pushnil(L); return 1; }
+    int32_t flags = 0;
+    Engine::safeReadInt32((uint8_t*)obj + 0x18, &flags);
+    char buf[20]; std::snprintf(buf, sizeof(buf), "0x%08X", flags);
+    lua_pushstring(L, buf);
+    return 1;
+}
+
 // -- Hydro.UI.stripAbstract -------------------------------------------
 
 /// Clear `CLASS_Abstract` (0x1) on the given UClass. Required ONLY if
@@ -132,10 +367,17 @@ static int l_ui_stripAbstract(lua_State* L) {
 // -- Module registration ----------------------------------------------
 
 static const luaL_Reg ui_functions[] = {
-    {"newObject",     l_ui_newObject},
-    {"findObject",    l_ui_findObject},
-    {"setText",       l_ui_setText},
-    {"stripAbstract", l_ui_stripAbstract},
+    {"newObject",       l_ui_newObject},
+    {"findObject",      l_ui_findObject},
+    {"setText",         l_ui_setText},
+    {"duplicateObject", l_ui_duplicateObject},
+    {"duplicateAndInitializeWidgetTree", l_ui_duplicateAndInitializeWidgetTree},
+    {"dumpProperties",  l_ui_dumpProperties},
+    {"readPointer",     l_ui_readPointer},
+    {"getSuperClass",   l_ui_getSuperClass},
+    {"getClassFlags",   l_ui_getClassFlags},
+    {"getObjectFlags",  l_ui_getObjectFlags},
+    {"stripAbstract",   l_ui_stripAbstract},
     {nullptr,         nullptr},
 };
 

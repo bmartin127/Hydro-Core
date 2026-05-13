@@ -7,6 +7,8 @@
 #include "engine/Internal.h"
 #include "engine/Patternsleuth.h"
 #include "engine/Shaders.h"
+#include "engine/Duplicate.h"
+#include "engine/WidgetInit.h"
 #include "engine/GMalloc.h"
 #include "engine/IoStoreOnDemand.h"
 #include "engine/GUObjectArray.h"
@@ -59,7 +61,8 @@ static bool tryCallSCOCandidate(uint8_t* candidate, const void* params, void** o
 static void staticLoadObjectCrashed(bool wasFromCache);
 
 // Discovered function pointers (s_staticLoadObject and related lookup ptrs are
-// defined in engine/ObjectLookup.cpp; declared via engine/ObjectLookup.h)
+// defined in engine/ObjectLookup.cpp; declared via engine/ObjectLookup.h.
+// s_staticDuplicateObject{,Ex} live in engine/Duplicate.cpp - see Duplicate.h.)
 static void* s_staticConstructObject = nullptr;  // StaticConstructObject_Internal - UE's NewObject primitive
 
 // Discovered engine objects
@@ -90,6 +93,8 @@ struct ScanCache {
     ptrdiff_t staticFindObjectFast;  // StaticFindObjectFast offset
     ptrdiff_t openShaderLibrary;     // FShaderCodeLibrary::OpenLibrary offset
     ptrdiff_t staticConstructObject; // StaticConstructObject_Internal offset
+    ptrdiff_t staticDuplicateObjectEx; // StaticDuplicateObjectEx (params struct entry) offset
+    ptrdiff_t staticDuplicateObject;   // StaticDuplicateObject 7-arg wrapper offset
     ptrdiff_t ioStoreOnDemandMount;  // UE::IoStore::OnDemand::Mount offset (0 = not present on this host)
     ptrdiff_t ioStoreOnDemandSingletonGlobal;  // Address of the global holding the IOnDemandIoStore* singleton (re-deref at call time)
     // Layer 2/4 discovered struct field offsets (-1 = not yet discovered)
@@ -105,6 +110,7 @@ struct ScanCache {
     int32_t fpropEnumEnum;       // Derived - FEnumProperty::Enum
     int32_t fpropByteEnum;       // Derived - FByteProperty::Enum
     ptrdiff_t arSerializeFnOff;  // UAssetRegistryImpl::Serialize function offset from base (0 = not yet probed)
+    ptrdiff_t duplicateAndInitFromWidgetTreeOff; // UUserWidget::DuplicateAndInitializeFromWidgetTree offset (0 = not yet probed)
 };
 
 // Bumped to 0x48594463 - replaces arSerializeSlot (vtable index) with
@@ -114,7 +120,18 @@ struct ScanCache {
 // __FUNCTION__ anchors (FAssetRegistryImpl::CachePathsFromState +
 // FAssetRegistryState::Save), bypassing the vtable entirely.
 // Caches written under earlier magics get invalidated.
-static const uint32_t CACHE_MAGIC = 0x48594463;
+// Bumped to 0x48594464 - added staticDuplicateObjectEx + staticDuplicateObject
+// offsets so the WBP runtime-instantiation bridge (UE 5.6 cooked WBP fix -
+// see project_wbp_init_failure memory) survives across launches without
+// re-scanning. Caches written under earlier magics get invalidated.
+// Bumped to 0x48594465 - added duplicateAndInitFromWidgetTreeOff so the
+// WBP InitializeWidget bypass survives across launches without re-scanning.
+// Bumped to 0x48594466 - D&IFWT resolver fixed (picks LAST E8 in window,
+// not biggest target). Old cache stored WBPGC::StaticClass by accident.
+// Bumped to 0x48594467 - D&IFWT picks E8 whose target prologue does
+// gs:[0x58] TLS read (D&IFWT's TScopeCounter). "Last E8" was wrong too
+// because TMap teardown destructors run after D&IFWT in the window.
+static const uint32_t CACHE_MAGIC = 0x48594467;
 
 static std::string getCachePath() {
     char path[MAX_PATH];
@@ -160,10 +177,13 @@ static void staticLoadObjectCrashed(bool wasFromCache) {
         s_staticFindObjectFast = nullptr;
         s_openShaderLibrary    = nullptr;
         s_staticConstructObject = nullptr;
+        s_staticDuplicateObjectEx = nullptr;
+        s_staticDuplicateObject   = nullptr;
         s_ioStoreOnDemandMount = nullptr;
         s_ioStoreOnDemandSingletonGlobal = nullptr;
         s_arSerializeFn = nullptr;  // code pointer - moves with ASLR, must clear on cache invalidation
-        s_poolReady            = false;  // <- critical: gates discoverFNamePool
+        s_duplicateAndInitFromWidgetTree = nullptr;
+        s_poolReady            = false;  // ← critical: gates discoverFNamePool
         // s_layout.* is intentionally kept - those are struct offsets
         // (e.g. 0x4C for FPROP_OFFSET_INTERNAL), not pointers. They don't
         // shift with ASLR and stay valid across launches.
@@ -206,9 +226,13 @@ static bool loadScanCache(const GameModule& gm) {
     s_staticFindObjectFast = cache.staticFindObjectFast ? (gm.base + cache.staticFindObjectFast) : nullptr;
     s_openShaderLibrary    = cache.openShaderLibrary    ? (gm.base + cache.openShaderLibrary)    : nullptr;
     s_staticConstructObject = cache.staticConstructObject ? (gm.base + cache.staticConstructObject) : nullptr;
+    s_staticDuplicateObjectEx = cache.staticDuplicateObjectEx ? (gm.base + cache.staticDuplicateObjectEx) : nullptr;
+    s_staticDuplicateObject   = cache.staticDuplicateObject   ? (gm.base + cache.staticDuplicateObject)   : nullptr;
     s_ioStoreOnDemandMount = cache.ioStoreOnDemandMount ? (gm.base + cache.ioStoreOnDemandMount) : nullptr;
     s_ioStoreOnDemandSingletonGlobal = cache.ioStoreOnDemandSingletonGlobal ? (gm.base + cache.ioStoreOnDemandSingletonGlobal) : nullptr;
     s_arSerializeFn = cache.arSerializeFnOff ? (void*)(gm.base + cache.arSerializeFnOff) : nullptr;
+    s_duplicateAndInitFromWidgetTree = cache.duplicateAndInitFromWidgetTreeOff
+        ? (void*)(gm.base + cache.duplicateAndInitFromWidgetTreeOff) : nullptr;
     if (cache.fnamePool && cache.poolBlocksOffset > 0) {
         s_fnamePool = gm.base + cache.fnamePool;
         s_poolBlocksOffset = cache.poolBlocksOffset;
@@ -284,6 +308,8 @@ void saveScanCache(const GameModule& gm) {
     cache.staticFindObjectFast = s_staticFindObjectFast ? ((uint8_t*)s_staticFindObjectFast - gm.base) : 0;
     cache.openShaderLibrary    = s_openShaderLibrary    ? ((uint8_t*)s_openShaderLibrary    - gm.base) : 0;
     cache.staticConstructObject = s_staticConstructObject ? ((uint8_t*)s_staticConstructObject - gm.base) : 0;
+    cache.staticDuplicateObjectEx = s_staticDuplicateObjectEx ? ((uint8_t*)s_staticDuplicateObjectEx - gm.base) : 0;
+    cache.staticDuplicateObject   = s_staticDuplicateObject   ? ((uint8_t*)s_staticDuplicateObject   - gm.base) : 0;
     cache.ioStoreOnDemandMount = s_ioStoreOnDemandMount ? ((uint8_t*)s_ioStoreOnDemandMount - gm.base) : 0;
     cache.ioStoreOnDemandSingletonGlobal = s_ioStoreOnDemandSingletonGlobal ? (s_ioStoreOnDemandSingletonGlobal - gm.base) : 0;
     cache.childPropsOffset     = (s_layout.succeeded ? s_layout.childPropsOffset : -1);
@@ -300,6 +326,8 @@ void saveScanCache(const GameModule& gm) {
     cache.fpropEnumEnum        = s_layout.enumPropEnum;
     cache.fpropByteEnum        = s_layout.bytePropEnum;
     cache.arSerializeFnOff     = s_arSerializeFn ? ((uint8_t*)s_arSerializeFn - gm.base) : 0;
+    cache.duplicateAndInitFromWidgetTreeOff = s_duplicateAndInitFromWidgetTree
+        ? ((uint8_t*)s_duplicateAndInitFromWidgetTree - gm.base) : 0;
 
     auto path = getCachePath();
     FILE* f = fopen(path.c_str(), "wb");
@@ -766,7 +794,7 @@ bool initialize() {
                             candidates[numCandidates++] = {funcStart, funcSize};
                     }
 
-                    Hydro::logInfo("EngineAPI: %d callers of StaticFindObjectFast -> %d unique size-range candidates",
+                    Hydro::logInfo("EngineAPI: %d callers of StaticFindObjectFast → %d unique size-range candidates",
                         callerCount, numCandidates);
 
                     // Sort candidates by size descending - try the largest first
@@ -1005,7 +1033,7 @@ bool initialize() {
     }
 
     // FName resolution MUST come before AssetRegistry/engine-object discovery.
-    // Both discovery paths call findObject -> getObjectName -> FNamePool reads;
+    // Both discovery paths call findObject → getObjectName → FNamePool reads;
     // if FNamePool isn't discovered yet, getObjectName returns "<FName:N>"
     // placeholders and string-based scans miss everything. Previous order
     // bug: FNamePool was at the end of init, so a fresh init after SLO-crash-
@@ -1036,7 +1064,7 @@ bool initialize() {
 
     // FShaderCodeLibrary::OpenLibrary - needed for runtime-mounted mod paks
     // to actually render their materials. Without it, paks mount but their
-    // shader archives stay invisible to the renderer -> materials fall back
+    // shader archives stay invisible to the renderer → materials fall back
     // to defaults.
     if (!s_openShaderLibrary) {
         if (findOpenShaderLibrary()) {
@@ -1058,6 +1086,39 @@ bool initialize() {
             saveScanCache(s_gm);
         } else {
             Hydro::logWarn("EngineAPI: StaticConstructObject not found - runtime UObject construction unavailable");
+        }
+    }
+
+    // StaticDuplicateObject - UE's archive-based deep-copy primitive. The
+    // pair (SDOEx + the public 7-arg wrapper SDO) is what we need for
+    // cooked-WBP runtime instantiation: the standard Create() path on
+    // UE 5.6 uses NewObject-with-template + an InstancingGraph filter that
+    // skips `UWidgetTree::RootWidget` (no CPF_InstancedReference), leaving
+    // the instance tree empty. StaticDuplicateObject bypasses that by
+    // serializing source → memory archive → new object, which copies every
+    // UPROPERTY regardless of Instanced/Transient flags. Same primitive
+    // unlocks AnimBP templates, complex materials with subobjects, etc.
+    // See project_wbp_init_failure memory for the diagnostic chain.
+    if (!s_staticDuplicateObjectEx) {
+        if (findStaticDuplicateObject()) {
+            saveScanCache(s_gm);
+        } else {
+            Hydro::logWarn("EngineAPI: StaticDuplicateObject not found - WBP runtime instantiation unavailable");
+        }
+    }
+
+    // UUserWidget::DuplicateAndInitializeFromWidgetTree - the direct deep-
+    // copy primitive used by the cooked-WBP runtime path. On UE 5.6 the
+    // `InitializeWidgetStatic` gate skips this entirely when
+    // `widget->WidgetTree` is non-null on entry (which it is, in practice).
+    // We resolve it via structural anchor on the gate and call it
+    // directly from Lua to route around the broken init decision chain.
+    // See project_wbp_init_failure memory.
+    if (!s_duplicateAndInitFromWidgetTree) {
+        if (findDuplicateAndInitFromWidgetTree()) {
+            saveScanCache(s_gm);
+        } else {
+            Hydro::logWarn("EngineAPI: D&IFWT not found - WBP bypass unavailable");
         }
     }
 
@@ -1279,6 +1340,21 @@ bool refreshWorld() {
 // SCO test-call validator in findStaticConstructObject empirically
 // confirmed this on UE 5.6 cooks.
 void* staticConstructObject(void* uclass, void* outer) {
+    return staticConstructObjectWithTemplate(uclass, outer, nullptr);
+}
+
+// Extended SCO with Template pointer support. Template field sits at
+// offset 0x28 in FStaticConstructObjectParameters across UE 5.x (after
+// Class[0]/Outer[8]/Name[0x10]/Flags[0x18..0x20]/two bools[0x20..0x22]/
+// padding to 0x28). When non-null, UE deep-copies properties from the
+// template into the new object - same primitive UE uses for default
+// subobject construction.
+//
+// Use case: bypass UE 5.6's broken `InitializeWidgetStatic` path by
+// constructing fresh widget instances (CanvasPanel, TextBlock, etc.) at
+// runtime using the class-level archetype CanvasPanels as templates.
+// See project_wbp_init_failure for the diagnostic chain.
+void* staticConstructObjectWithTemplate(void* uclass, void* outer, void* tmpl) {
     if (!s_staticConstructObject) {
         Hydro::logWarn("EngineAPI: staticConstructObject called but SCO not resolved");
         return nullptr;
@@ -1289,8 +1365,16 @@ void* staticConstructObject(void* uclass, void* outer) {
     }
 
     alignas(16) uint8_t paramBuf[256] = {};
-    *(void**)(paramBuf + 0) = uclass;
-    *(void**)(paramBuf + 8) = outer;
+    *(void**)(paramBuf + 0x00) = uclass;
+    *(void**)(paramBuf + 0x08) = outer;
+    // Name (+0x10) = NAME_None - zero.
+    // SetFlags / InternalSetFlags (+0x18..+0x20) = 0 - defaults.
+    // bCopyTransientsFromClassDefaults (+0x20) = 0.
+    // bAssumeTemplateIsArchetype (+0x21) = 0 - Template is treated as a
+    // regular instance to duplicate from (not a CDO archetype).
+    *(void**)(paramBuf + 0x28) = tmpl;  // Template
+    // InstanceGraph (+0x30) = null - engine builds its own.
+    // ExternalPackage (+0x38) = null.
 
     using SCOFn = void* (*)(const void*);
     auto fn = (SCOFn)s_staticConstructObject;
@@ -1298,12 +1382,14 @@ void* staticConstructObject(void* uclass, void* outer) {
     __try {
         result = fn(paramBuf);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Hydro::logError("EngineAPI: staticConstructObject faulted (uclass=%p outer=%p)",
-            uclass, outer);
+        Hydro::logError("EngineAPI: staticConstructObjectWithTemplate faulted "
+            "(uclass=%p outer=%p tmpl=%p)", uclass, outer, tmpl);
         return nullptr;
     }
     return result;
 }
+
+// `staticDuplicateObject` lives in engine/Duplicate.cpp (see Duplicate.h).
 
 // --- UE-indexed player / actor lookups ---------------------------------
 //
@@ -1924,7 +2010,7 @@ static bool findStaticConstructObject() {
         return nullptr;
     };
 
-    std::unordered_map<uint32_t, RUNTIME_FUNCTION*> uniqueFuncs;  // BeginRva -> entry
+    std::unordered_map<uint32_t, RUNTIME_FUNCTION*> uniqueFuncs;  // BeginRva → entry
     for (uint8_t* lea : leas) {
         if (auto* f = findFunc(lea)) {
             uniqueFuncs.emplace(f->BeginAddress, f);
@@ -1992,11 +2078,82 @@ static bool findStaticConstructObject() {
     // are stable across versions.
     alignas(16) uint8_t paramBuf[256] = {};
     *(void**)(paramBuf + 0) = uobjectClass;   // Class
-    *(void**)(paramBuf + 8) = nullptr;        // Outer = nullptr -> SCO uses transient package
+    *(void**)(paramBuf + 8) = nullptr;        // Outer = nullptr → SCO uses transient package
+
+    // Pre-screen: find the ExitProcess import thunk so we can skip any
+    // candidate that calls it (ExitProcess bypasses SEH, killing the process).
+    uint8_t* exitProcessThunk = nullptr;
+    {
+        auto* dosHdr = (IMAGE_DOS_HEADER*)s_gm.base;
+        auto* ntHdr  = (IMAGE_NT_HEADERS*)(s_gm.base + dosHdr->e_lfanew);
+        auto& impDir = ntHdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (impDir.VirtualAddress && impDir.Size) {
+            auto* desc = (IMAGE_IMPORT_DESCRIPTOR*)(s_gm.base + impDir.VirtualAddress);
+            for (; desc->Name; ++desc) {
+                const char* modName = (const char*)(s_gm.base + desc->Name);
+                if (_stricmp(modName, "KERNEL32.dll") != 0 &&
+                    _stricmp(modName, "kernel32.dll") != 0) continue;
+                auto* thunkRef = (IMAGE_THUNK_DATA*)(s_gm.base + desc->OriginalFirstThunk);
+                auto* funcRef  = (IMAGE_THUNK_DATA*)(s_gm.base + desc->FirstThunk);
+                for (; thunkRef->u1.AddressOfData; ++thunkRef, ++funcRef) {
+                    if (IMAGE_SNAP_BY_ORDINAL(thunkRef->u1.Ordinal)) continue;
+                    auto* name = (IMAGE_IMPORT_BY_NAME*)(s_gm.base + (uint32_t)thunkRef->u1.AddressOfData);
+                    if (strcmp(name->Name, "ExitProcess") == 0) {
+                        exitProcessThunk = (uint8_t*)(uintptr_t)funcRef->u1.Function;
+                        break;
+                    }
+                }
+                if (exitProcessThunk) break;
+            }
+        }
+        if (exitProcessThunk)
+            Hydro::logInfo("EngineAPI: SCO pre-screen: ExitProcess thunk at %p", exitProcessThunk);
+    }
+
+    auto candCallsExitProcess = [&](uint8_t* fn, uint32_t fnSize) -> bool {
+        // Scan for: FF 25 [rel32] (JMP QWORD PTR [rip+disp]) landing on exitProcessThunk
+        // or: E8 [rel32] CALL landing on an ExitProcess-calling stub
+        // Quick heuristic: look for __fastfail pattern (CD 29) first.
+        uint32_t limit = fnSize < 512 ? fnSize : 512;
+        for (uint32_t k = 0; k + 1 < limit; k++) {
+            if (fn[k] == 0xCD && fn[k+1] == 0x29) return true;  // int 0x29 (__fastfail)
+        }
+        if (!exitProcessThunk) return false;
+        for (uint32_t k = 0; k + 5 < limit; k++) {
+            if (fn[k] == 0xFF && fn[k+1] == 0x25) {             // JMP [rip+disp32]
+                int32_t disp = 0; memcpy(&disp, fn + k + 2, 4);
+                uint8_t* target = fn + k + 6 + disp;
+                if (target == exitProcessThunk) return true;
+            }
+            if (fn[k] == 0xE8) {                                 // CALL rel32
+                int32_t disp = 0; memcpy(&disp, fn + k + 1, 4);
+                uint8_t* target = fn + k + 5 + disp;
+                if (target == exitProcessThunk) return true;
+            }
+        }
+        return false;
+    };
 
     int bestIdx = -1;
-    for (size_t i = 0; i < ranked.size() && i < 4; i++) {
+    for (size_t i = 0; i < ranked.size() && i < 8; i++) {
         uint8_t* cand = ranked[i].first;
+
+        // Size filter: SCO is hundreds of bytes; param-ctor is tiny. Skip tiny ones.
+        uint32_t candSize = 0;
+        if (auto* f = findFunc(cand)) candSize = f->EndAddress - f->BeginAddress;
+        if (candSize < 256) {
+            Hydro::logInfo("EngineAPI: SCO pre-screen: candidate [%zu] exe+0x%zX size=%u too small - skipping",
+                i, (size_t)(cand - s_gm.base), candSize);
+            continue;
+        }
+
+        // ExitProcess / __fastfail check - skip anything that can kill the process.
+        if (candCallsExitProcess(cand, candSize)) {
+            Hydro::logInfo("EngineAPI: SCO pre-screen: candidate [%zu] exe+0x%zX contains ExitProcess/__fastfail - skipping",
+                i, (size_t)(cand - s_gm.base));
+            continue;
+        }
+
         void* result = nullptr;
         if (!tryCallSCOCandidate(cand, paramBuf, &result)) {
             Hydro::logInfo("EngineAPI: SCO test-call: candidate [%zu] exe+0x%zX FAULTED - not SCO",
@@ -2047,6 +2204,7 @@ static bool tryCallSCOCandidate(uint8_t* candidate, const void* params, void** o
     }
 }
 
+
 // -- UMG SetText via Conv_StringToText shim ------------------------------
 //
 // UMG widgets' SetText UFunctions take FText, not FString - and FText
@@ -2054,8 +2212,8 @@ static bool tryCallSCOCandidate(uint8_t* candidate, const void* params, void** o
 // (FText::FromString is templated/inlined). Route through the
 // `UKismetTextLibrary::Conv_StringToText` BlueprintPure UFunction:
 //
-//   FString -> ProcessEvent(Conv_StringToText) -> FText
-//   FText   -> ProcessEvent(widget.SetText)
+//   FString → ProcessEvent(Conv_StringToText) → FText
+//   FText   → ProcessEvent(widget.SetText)
 //
 // FText is an opaque struct (TSharedPtr<ITextData> + uint32 flags) ~24
 // bytes in shipping. We don't need to know its internal layout - just

@@ -15,6 +15,8 @@ add_library(${TARGET} SHARED
     engine/ObjectLookup.cpp
     engine/AssetRegistry.cpp
     engine/Spawn.cpp
+    engine/Duplicate.cpp
+    engine/WidgetInit.cpp
     HydroCore.cpp
     LuaRuntime.cpp
     LuaUObject.cpp
@@ -50,7 +52,7 @@ target_include_directories(${TARGET} PRIVATE
 target_link_libraries(${TARGET} PUBLIC UE4SS)
 target_link_libraries(${TARGET} PRIVATE "${LUAJIT_DIR}/lua51.lib")
 
-# Zydis — x86-64 disassembler used by installInlineHookAt() for correct
+# Zydis - x86-64 disassembler used by installInlineHookAt() for correct
 # prologue decoding (including rip-relative instruction relocation). The
 # library is pulled in as a transitive dep of PolyHook via UE4SS's deps
 # tree; we link directly so our own hooking logic can use it without

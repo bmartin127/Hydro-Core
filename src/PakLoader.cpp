@@ -341,7 +341,7 @@ static void* findPakMountFn(GameModule gm) {
     //
     // Earlier "Mounting pak file" / "Mounted IoStore container" / "Failed to
     // mount pak" candidates all lead to the WRONG function:
-    //   - "Mounting pak file" -> FHandleMountPaksExDelegate::HandleDelegate
+    //   - "Mounting pak file" → FHandleMountPaksExDelegate::HandleDelegate
     //     (line 6477) which has TArrayView<FMountPaksExArgs> args, not
     //     FPakMountArgs - calling it with our struct crashes.
     //   - "Mounted IoStore container" / "Failed to mount pak" - Display-level

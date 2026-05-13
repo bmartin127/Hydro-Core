@@ -299,8 +299,8 @@ void Core::executePakMounts() {
     // for the file-mount side, which engine startup already handled for us).
     // The function pointer is resolved on first call by anchor-driven discovery
     // (EngineAPI::findArSerializeFn - two __FUNCTION__ anchors in the inner
-    // callee chain -> LEA xref -> .pdata -> E8-caller-climb to the outer virtual
-    // -> single SEH-guarded verify call) and persisted in ScanCache so warm
+    // callee chain → LEA xref → .pdata → E8-caller-climb to the outer virtual
+    // → single SEH-guarded verify call) and persisted in ScanCache so warm
     // starts skip the scan entirely.
     //
     // Idempotency: on hosts where the engine already merged AR (5.5, Palworld
@@ -523,7 +523,7 @@ void Core::pollHydroPaks() {
             wpak.c_str(),
             war.empty() ? nullptr : war.c_str(),
             /*priority=*/1000);
-        logInfo("HydroPaks watcher: mount '%s' -> %s", fname.c_str(),
+        logInfo("HydroPaks watcher: mount '%s' → %s", fname.c_str(),
                 ok ? "OK" : "FAIL");
         // Only mark as seen on success. If mount fails (typically because
         // FPakPlatformFile reverse-discovery hasn't completed yet), retry
@@ -595,7 +595,7 @@ bool Core::cleanupDeployedPaks() {
             // Match three shapes:
             //   1. legacy `Hydro_*` (pre-chunked-shader-library era)
             //   2. transient `pakchunk<N>-Hydro_*` (one-day intermediate)
-            //   3. current `pakchunk<N>-Windows.<ext>` where N ∈ [10000,99999]
+            //   3. current `pakchunk<N>-Windows.<ext>` where N in [10000,99999]
             //      - our reserved chunk-index range from the FNV-1a mod_id hash.
             //      Host-shipped paks use small N (typically 0..few-hundred);
             //      our high range avoids collision with host content.
@@ -676,7 +676,7 @@ bool Core::deployPaks() {
 
                 // Filename MUST start with "pakchunk<N>" so UE's PakGetPakchunkIndex
                 // parses N as the pak's chunk index. UE then uses that index in
-                // GetShaderLibraryNameForChunk("<HostProject>", N) -> "<HostProject>_Chunk<N>",
+                // GetShaderLibraryNameForChunk("<HostProject>", N) → "<HostProject>_Chunk<N>",
                 // which matches the in-pak shader archive name written by hydro-cli.
                 uint32_t chunkIndex = stableChunkIndexForMod(mod.modId);
 

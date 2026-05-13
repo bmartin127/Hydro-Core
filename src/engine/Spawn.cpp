@@ -218,7 +218,7 @@ void* findDispatchBeginPlay(int beginPlayVtableOffset) {
     //   +1000 if exactly 1 virtual call at the offset (DispatchBeginPlay
     //         invokes BeginPlay exactly once - functions with many such
     //         calls are almost certainly something else)
-    //   +200 per caller (non-leaf -> more likely a dispatch funnel)
+    //   +200 per caller (non-leaf → more likely a dispatch funnel)
     //   +100 if function is reasonably sized (32..256 bytes)
     //   +50 per flag write (up to 3)
     //   -200 if function is very large (>400 bytes; DispatchBeginPlay is tight)
@@ -482,7 +482,7 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
             std::string chain;
             void* cur = actorClass;
             for (int d = 0; d < 8 && cur; d++) {
-                if (!chain.empty()) chain += " -> ";
+                if (!chain.empty()) chain += " → ";
                 chain += getObjectName(cur);
                 void* super = nullptr;
                 if (!safeReadPtr((uint8_t*)cur + superOff, &super)) break;
@@ -512,7 +512,7 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
             // UClass via findObject - re-resolve through the same path.)
             void* aactorPtr = findObject(L"/Script/Engine.Actor");
             if (aactorPtr && aactorPtr != actorClass) {
-                Hydro::logInfo("  delta vs AActor (offsets where bytes differ):");
+                Hydro::logInfo("  Δ vs AActor (offsets where bytes differ):");
                 for (int off = 0x80; off <= 0x180; off += 4) {
                     int32_t mine = 0, actor = 0;
                     if (!safeReadInt32((uint8_t*)actorClass + off, &mine)) continue;
@@ -522,7 +522,7 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
                     // SuperStruct / ChildProperties / etc).
                     uint32_t mu = (uint32_t)mine, au = (uint32_t)actor;
                     if (mu >= 0x40000000u || au >= 0x40000000u) continue;
-                    Hydro::logInfo("    +0x%03X: actor=0x%08X  ours=0x%08X  delta=0x%08X",
+                    Hydro::logInfo("    +0x%03X: actor=0x%08X  ours=0x%08X  Δ=0x%08X",
                                    off, au, mu, mu ^ au);
                 }
             }
@@ -563,7 +563,7 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
                 uint32_t fixed = (uint32_t)cf & ~kClassAbstract;
                 *(uint32_t*)((uint8_t*)actorClass + kClassFlagsOff) = fixed;
                 Hydro::logInfo("EngineAPI: stripped CLASS_Abstract on %p "
-                               "(0x%08X -> 0x%08X) for runtime spawn",
+                               "(0x%08X → 0x%08X) for runtime spawn",
                                actorClass, (uint32_t)cf, fixed);
             }
         }
@@ -595,7 +595,7 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
         }
 
         // DIAG: diff the param block. List every offset where a byte changed.
-        // If nothing changed -> ProcessEvent didn't dispatch. If changes are
+        // If nothing changed → ProcessEvent didn't dispatch. If changes are
         // confined to slots we expect (retOff and possibly Owner / pad), the
         // call ran cleanly and the engine just returned null. If unexpected
         // slots changed, our layout is wrong.
@@ -614,7 +614,7 @@ void* spawnActor(void* actorClass, double x, double y, double z) {
                 row,
                 aft[0],  aft[1],  aft[2],  aft[3],  aft[4],  aft[5],  aft[6],  aft[7],
                 aft[8],  aft[9],  aft[10], aft[11], aft[12], aft[13], aft[14], aft[15],
-                rowDiff ? "  (delta)" : "");
+                rowDiff ? "  (Δ)" : "");
         }
 
         void* result = (s_spawnLayout.retOff >= 0)

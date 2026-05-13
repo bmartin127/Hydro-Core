@@ -69,8 +69,8 @@ static int l_assets_load(lua_State* L) {
 /// AssetRegistry lookup. Uses the same path `Assets.spawn`'s Tier-3
 /// fallback uses internally. Useful when investigating whether a load
 /// failure is "AR doesn't know about it" (Assets.load returns nil but
-/// directLoad succeeds -> AR is the blocker, FPackageStore has the package)
-/// vs. "FPackageStore doesn't have it" (both return nil -> deeper issue).
+/// directLoad succeeds → AR is the blocker, FPackageStore has the package)
+/// vs. "FPackageStore doesn't have it" (both return nil → deeper issue).
 ///
 /// Not the recommended user-facing API - `Assets.load` should be used in
 /// shipping mod code. This is for diagnostics during host-bringup.

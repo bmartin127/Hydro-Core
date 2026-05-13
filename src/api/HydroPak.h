@@ -6,7 +6,7 @@
 ///   AssetRegistry.bin via IAssetRegistry::AppendState.
 ///
 ///   Discovery prerequisite: HydroCore's AppendState bridge must have run
-///   at least once (it captures FFilePackageStoreBackend -> reverse-derives
+///   at least once (it captures FFilePackageStoreBackend → reverse-derives
 ///   FPakPlatformFile). Until then, mount() returns false.
 ///
 /// @depends EngineAPI (mountPakAtRuntime), PakLoader, AppendState bridge

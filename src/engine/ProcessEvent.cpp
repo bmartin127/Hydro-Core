@@ -17,8 +17,8 @@ ProcessEventFn s_processEvent = nullptr;
 
 // Cached ProcessEvent vtable slot. -1 = not yet probed. UObject's vtable
 // layout shifted across UE versions; UE4SS data confirms slot positions:
-//   5.0 -> 75 (0x258), 5.1/5.6/5.7 -> 76 (0x260), 5.2-5.4 -> 77 (0x268),
-//   5.5 -> 79 (0x278). Probing on first call avoids hardcoded-per-version
+//   5.0 → 75 (0x258), 5.1/5.6/5.7 → 76 (0x260), 5.2-5.4 → 77 (0x268),
+//   5.5 → 79 (0x278). Probing on first call avoids hardcoded-per-version
 // branches and discovers the right slot empirically.
 static int s_peSlot = -1;
 static bool s_peProbeFailed = false;

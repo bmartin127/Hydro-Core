@@ -253,7 +253,7 @@ private:
     // SerializeVersion) reads CustomVersionContainer and iterates its
     // `Versions` TArray. With nullptr the iteration helper AVs immediately
     // at `mov rax, [rcx]`. Pointing CustomVersionContainer here gives a
-    // valid empty array -> cmp cur,end equal -> loop exits no-op.
+    // valid empty array → cmp cur,end equal → loop exits no-op.
     // Size = 16 bytes (TArray header) + a few extra for forward-compat.
     alignas(8) uint8_t m_customVersionsStub[64] = {};
 

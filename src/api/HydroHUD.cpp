@@ -49,7 +49,7 @@ static void* s_activeHUD = nullptr;
 
 /// Return the local player's AHUD instance, or nil if not yet available.
 ///
-/// Walks: Character (PlayerIndex 0) -> Controller property -> MyHUD
+/// Walks: Character (PlayerIndex 0) → Controller property → MyHUD
 /// property. Each link reflects via `Engine::findProperty`; we don't
 /// hardcode field offsets so this works across UE versions and host
 /// engine forks. Any null link returns nil cleanly.
@@ -106,7 +106,7 @@ static int l_hud_getPlayerHUD(lua_State* L) {
 // Returns true if MyHUD is now non-null (either was already, or we
 // spawned one). Returns false if we couldn't find a player or spawn
 // failed - caller can retry on a later tick.
-// Throttle: log only on state transitions (failure -> success or
+// Throttle: log only on state transitions (failure → success or
 // failure-reason-change), not every BeginPlay-triggered retry. UE 5.6 cooks
 // fire hundreds of BeginPlays during level stream-in before the player
 // spawns; without throttling we'd dump hundreds of identical lines.
@@ -335,7 +335,7 @@ function HUD.onDraw(fn)
     end
 
     -- Fallback for stripped-HUD hosts (DMG-style): if MyHUD isn't wired,
-    -- spawn one ourselves so the engine actually dispatches DrawHUD ->
+    -- spawn one ourselves so the engine actually dispatches DrawHUD →
     -- ReceiveDrawHUD every frame. Real games already have a HUD and
     -- _ensureHUD becomes a no-op for them.
     --
@@ -352,7 +352,7 @@ function HUD.onDraw(fn)
 
     -- _dispatchDraw is a C closure factory: passing `fn` as the only
     -- upvalue gives us a per-callback dispatcher that bridges
-    -- HydroEvents' (ahud) -> user's () shape.
+    -- HydroEvents' (ahud) → user's () shape.
     local ok, err = pcall(function()
         Events.hook(DRAW_HOOK_PATH, function(ahud) HUD._dispatchDraw(ahud, fn) end)
     end)

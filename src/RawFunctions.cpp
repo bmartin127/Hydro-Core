@@ -78,7 +78,7 @@ uint8_t* findLeaRefIn(uint8_t* base, size_t size, uint8_t* target) {
     for (size_t i = 0; i + 7 < size; i++) {
         if ((base[i] == 0x48 || base[i] == 0x4C) && base[i + 1] == 0x8D) {
             uint8_t modrm = base[i + 2];
-            // ModR/M with mod=00 reg=*** rm=101 -> rip-relative disp32.
+            // ModR/M with mod=00 reg=*** rm=101 → rip-relative disp32.
             // Accept both lo (rax/rcx/...) and hi (r8..r15 - REX.R bit) regs.
             if ((modrm & 0xC7) != 0x05 && (modrm & 0xC7) != 0x0D &&
                 (modrm & 0xC7) != 0x15 && (modrm & 0xC7) != 0x1D &&

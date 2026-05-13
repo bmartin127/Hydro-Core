@@ -152,7 +152,7 @@ bool readToLua(lua_State* L, void* prop, const uint8_t* data) {
     }
     // Structs. When Stage H validated the FStructProperty::Struct offset,
     // walk the UScriptStruct's ChildProperties chain and recurse on each
-    // field - produces real field names (FRotator -> {Pitch, Yaw, Roll}, not
+    // field - produces real field names (FRotator → {Pitch, Yaw, Roll}, not
     // FVector's {X, Y, Z}). Falls back to the FVector size heuristic if
     // discovery couldn't validate the offset, so non-UE-5.5 hosts still
     // decode FVector correctly.
@@ -172,7 +172,7 @@ bool readToLua(lua_State* L, void* prop, const uint8_t* data) {
             }
             return true;
         }
-        // Fallback: layout discovery failed -> keep the size heuristic so
+        // Fallback: layout discovery failed → keep the size heuristic so
         // FVector-shaped reads don't regress.
         if (size == 24) {
             lua_newtable(L);
